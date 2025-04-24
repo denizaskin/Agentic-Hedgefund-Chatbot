@@ -128,7 +128,7 @@ If you get a "No module named yfinance" error, please try:
 
 ## Key Components
 
-	## Disabling File Watchers**
+**Disabling File Watchers**
 ```bash
 os.environ["STREAMLIT_SERVER_FILE_WATCHER_TYPE"] = "none"
 ```
