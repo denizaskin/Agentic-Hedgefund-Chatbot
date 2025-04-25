@@ -945,7 +945,7 @@ def run_td3_agent_thread(out_queue, hyper_json):
         portfolio_values = []
         num_episodes = 50
         batch_size = 64
-        max_steps = len(df_merged) - 1
+        max_steps = 50
 
         print("Training TD3 Agent...\n")
 
