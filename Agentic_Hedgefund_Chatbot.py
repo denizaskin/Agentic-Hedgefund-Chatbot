@@ -112,14 +112,6 @@ parameters = {
     "seed": 42
 }
 
-llm_llama = ChatWatsonx(
-    model_id=model_id_llama,
-    url=url,
-    apikey=apikey,
-    project_id=project_id,
-    params=parameters
-)
-
 llm_chat_gpt = ChatOpenAI(
     model="gpt-4o",
     temperature=0,
@@ -128,6 +120,26 @@ llm_chat_gpt = ChatOpenAI(
     max_retries=2,
     api_key=openai_apikey
 )
+
+# 1-b  — Watson x **only** if a key is present
+if apikey and apikey.strip():
+    parameters = {
+        "decoding_method": "greedy",
+        "max_new_tokens": 10_000,
+        "temperature"    : 0,
+        "top_k"          : 1,
+        "top_p"          : 1.0,
+        "seed"           : 42,
+    }
+    llm_llama = ChatWatsonx(
+        model_id   = "meta-llama/llama-3-405b-instruct",
+        url        = url,
+        apikey     = apikey,
+        project_id = project_id,
+        params     = parameters,
+    )
+else:
+    llm_llama = None  # <-  just a placeholder; never used
 
 # We'll use GPT-4o by default:
 llm = llm_chat_gpt
@@ -138,6 +150,18 @@ llm = llm_chat_gpt
 def sanitize_control_chars(text: str) -> str:
     import re
     return re.sub(r'[\x00-\x1f\x7f]+', ' ', text)
+
+def _is_valid_ticker(tck: str) -> bool:
+    """
+    Return True if `tck` looks syntactically like a Yahoo Finance symbol
+    and yfinance can fetch at least 1-day of price history for it.
+    """
+    if not re.fullmatch(r"[A-Za-z\.\-\^]{1,10}", tck):
+        return False
+    try:
+        return not yf.Ticker(tck).history(period="1d").empty
+    except Exception:
+        return False
 
 ###############################################################################
 # PDF READER
@@ -277,7 +301,7 @@ def question_answerer_node(state: AgentWorkflowState) -> AgentWorkflowState:
     subtask_answers = execution_result.get("subtask_answers", [])
     context_str = ""
     for i, ans in enumerate(subtask_answers):
-        context_str += f"[Subtask #{i+1} - {ans['type']}]\nTask: {ans['task']}\n\nAnswer: {ans['answer']}\n\n"
+        context_str += f"[Subtask #{i+1} - {ans['type']}]\n{ans['task']}\n\nAnswer: {ans['answer']}\n\n"
 
     final_prompt = f"""
 You are the Question Answerer Agent.
@@ -325,7 +349,7 @@ class HRPParams(BaseModel):
 def hrp_param_decider(chatbot_answer: str) -> dict:
     parser = PydanticOutputParser(pydantic_object=HRPParams)
     prompt = f"""
-You are an HRP parameter decider.
+You are an HRP parameter decider. 
 Given the chatbot's final answer:
 
 {chatbot_answer}
@@ -339,6 +363,8 @@ Please return valid JSON containing HRP parameters. Must match this schema:
   "method": "ward"/"complete"/"single"
 }}
 No extra keys. No explanation. Just valid JSON.
+*Tickers must be valid Yahoo Finance symbols (max 10 characters, letters, dot or dash).*
+Return valid JSON only.
 """
     raw_text = stream_llm_call(prompt)
     try:
@@ -369,9 +395,22 @@ No extra text or commentary, just valid JSON.
 ###############################################################################
 # GET PREPROCESSED DATA => df_merged
 ###############################################################################
+def safe_download(ticker: str, start: str, end: str):
+    """
+    yfinance sometimes returns an empty DataFrame; try a fallback period.
+    """
+    df = yf.download(ticker, start=start, end=end, auto_adjust=True, progress=False)
+    if df is None or df.empty:
+        # fallback = last 1y (yfinance guarantees something if the symbol exists)
+        df = yf.download(ticker, period="1y", auto_adjust=True, progress=False)
+    if df is None or df.empty:
+        raise ValueError(f"yfinance returned no data for {ticker}.")  # stop early
+    return df
+
 def get_preprocessed_data():
-    spy_raw = yf.download("SPY", start="2025-01-01", end="2026-01-01", auto_adjust=True)
-    qqq_raw = yf.download("QQQ", start="2025-01-01", end="2026-01-01", auto_adjust=True)
+    spy_raw = safe_download("SPY", start="2025-01-01", end="2026-01-01")
+    qqq_raw = safe_download("QQQ", start="2025-01-01", end="2026-01-01")
+    # ... everything else stays exactly the same ...
 
     def compute_SMA(series, window=14):
         return series.rolling(window=window).mean()
@@ -448,19 +487,34 @@ df_merged = get_preprocessed_data()
 # ADVANCED MULTI ASSET ENV
 ###############################################################################
 class AdvancedMultiAssetTradingEnv(gym.Env):
-    """
-    Base environment for multi-asset trading. We'll rely on a child class
-    or step override to do actual reward logic.
-    """
-    def __init__(self, df, initial_balance=100000, commission=0.0005, slippage_pct=0.0005, spread=0.001):
+    def __init__(
+        self,
+        df,
+        initial_balance=100_000,
+        commission=0.0005,
+        slippage_pct=0.0005,
+        spread=0.001,
+    ):
         super().__init__()
+
+        # 1) keep a single copy of the reset-indexed dataframe
         self.df = df.reset_index(drop=True)
+
         self.initial_balance = float(initial_balance)
-        self.commission = commission
-        self.slippage_pct = slippage_pct
-        self.spread = spread
+        self.commission      = commission
+        self.slippage_pct    = slippage_pct
+        self.spread          = spread
+
+        # 2) action space: 2 continuous weights
         self.action_space = spaces.Box(low=0, high=1, shape=(2,), dtype=np.float32)
-        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(19,), dtype=np.float32)
+
+        # 3) observation space length must match the dataframe columns
+        obs_size = self.df.shape[1]
+        self.observation_space = spaces.Box(
+            low=-np.inf, high=np.inf, shape=(obs_size,), dtype=np.float32
+        )
+
+        # 4) initialise internal state
         self.reset()
 
     def reset(self):
@@ -474,10 +528,14 @@ class AdvancedMultiAssetTradingEnv(gym.Env):
         return self._get_state()
 
     def _get_state(self):
-        if self.current_step >= len(self.df):
-            self.current_step = len(self.df) - 1
-        # We'll produce a dummy 19-dim state
-        return np.zeros((19,), dtype=np.float32)
+        row = self.df.iloc[self.current_step].values.astype(np.float32)
+        # simple z-score normalisation per column (mean=0 std=1)
+        if not hasattr(self, "_mu"):
+            self._mu = self.df.mean().values
+            self._sigma = self.df.std().replace(0, 1).values
+        normed = (row - self._mu) / self._sigma
+        # clip extreme events
+        return np.clip(normed, -10, 10)
 
     def step(self, action):
         self.current_step += 1
@@ -670,9 +728,12 @@ Return only the updated query. No extra text.
         return original_query  # fallback if any error
 
 ###############################################################################
-# TD3 THREAD
+# TD3 THREAD (FROM CODE #2 EXACTLY)
 ###############################################################################
 def run_td3_agent_thread(out_queue, hyper_json):
+    """
+    The entire TD3 agent code below is copied verbatim from Code #2.
+    """
     import json
     class QueueStream:
         def __init__(self, q):
@@ -730,6 +791,7 @@ def run_td3_agent_thread(out_queue, hyper_json):
                 self.alloc_spy = w_spy
                 self.alloc_qqq = w_qqq
 
+                # Code #2 uses simpler approach:
                 reward = day_return * 1000.0
                 next_state = self._get_state()
                 return next_state, float(reward), done, {}
@@ -1049,6 +1111,9 @@ def main():
                             try:
                                 plan_dict = json.loads(st.session_state.planner_output)
                                 st.session_state.subtasks = plan_dict.get("subtasks", [])
+                                # Turn each subtask into a question if type=USER
+                                for s in st.session_state.subtasks:
+                                    s["task"] = rewrite_subtask_as_question(s["task"])
                                 st.session_state.subtask_answers = [None] * len(st.session_state.subtasks)
                             except Exception as e:
                                 st.session_state.conversation.append(f"Planner error: {e}")
@@ -1074,7 +1139,7 @@ def main():
                         if ans is not None:
                             context_str += (
                                 f"[Subtask #{i+1} - {ans['type']}]\n"
-                                f"Task: {ans['task']}\n\n"
+                                f"{ans['task']}\n\n"
                                 f"Answer: {ans['answer']}\n\n"
                             )
                     prompt_llm = f"""
@@ -1093,10 +1158,22 @@ Else answer.
 """
                     with st.spinner("Executing LLM subtask..."):
                         llm_response = stream_llm_call(prompt_llm).strip()
+                    if llm_response.upper().startswith("INSUFFICIENT"):
+                        missing_q_raw = llm_response.split(":", 1)[1].strip() if ":" in llm_response else ""
+                        if not missing_q_raw:
+                            missing_q_raw = "Could you please provide the missing information?"
+                        missing_q = rewrite_subtask_as_question(missing_q_raw)
+                        insert_pos = st.session_state.subtask_index + 1
+                        st.session_state.subtasks.insert(
+                            insert_pos,
+                            {"task": missing_q, "type": "USER"}
+                        )
+                        st.session_state.subtask_answers.insert(insert_pos, None)
+                        llm_response = "INSUFFICIENT — asked user"
 
                     new_line = (
                         f"[Subtask #{st.session_state.subtask_index+1} - LLM]\n"
-                        f"Task: {current['task']}\n\n"
+                        f"{current['task']}\n\n"
                         f"Answer: {llm_response}"
                     )
                     st.session_state.conversation.append(new_line)
@@ -1118,7 +1195,7 @@ Else answer.
                         else:
                             new_line = (
                                 f"[Subtask #{st.session_state.subtask_index+1} - USER]\n"
-                                f"Task: {current['task']}\n\n"
+                                f"{current['task']}\n\n"
                                 f"Answer: {user_response}"
                             )
                             st.session_state.conversation.append(new_line)
@@ -1180,6 +1257,11 @@ Else answer.
             help="Becomes active once chatbot is done and HRP params are decided."
         )
         if run_hrp_btn:
+            raw_tickers = st.session_state.hrp_dict.get("tickers", [])
+            cleaned = [t for t in raw_tickers if _is_valid_ticker(t)]
+            if not cleaned:  # fallback if everything invalid
+                cleaned = ["SPY", "EFA", "EEM", "AGG", "LQD", "GLD", "DBC"]
+            st.session_state.hrp_dict["tickers"] = cleaned
             with st.spinner("Running HRP..."):
                 hrp_logs = run_hrp_inline(
                     st.session_state.final_answer,
@@ -1307,56 +1389,84 @@ Else answer.
                 st.success("Reporter/Recommender Agent complete.")
 
         # ----------------------------------------------------------------------
-        # Rerun logic: If the reporter says "Rerun", we do a Requery => full reset
+        # Rerun logic with "Rerun code" button => does Requery + entire workflow
         # ----------------------------------------------------------------------
         if st.session_state.get("reporter_json"):
             st.write("### Reporter/Recommender Output")
             st.text_area("Reporter/Recommender JSON", st.session_state.reporter_json, height=300)
 
-            # Parse the JSON
             try:
-                rep_dict = json.loads(st.session_state.reporter_json)
+                raw = st.session_state.reporter_json
+                # in case there's leading/trailing text, extract the first {...}
+                m = re.search(r'\{.*\}', raw, re.S)
+                if not m:
+                    raise ValueError("Reporter JSON not found.")
+                rep_dict = json.loads(m.group(0))
+
                 if rep_dict.get("Decision") == "Rerun":
-                    # 1) Grab the explanation
-                    explanation = rep_dict.get("Explanation", "")
-                    st.warning("Reporter indicates a Rerun. Rewriting user query and restarting workflow...")
+                    st.warning("Reporter indicates a Rerun. Click 'Rerun code' to incorporate changes.")
+                    if st.button("Rerun code"):
+                        with st.spinner("Re-running the entire workflow with revised query..."):
+                            # 1) Re-query LLM => get updated user query
+                            explanation = rep_dict.get("Explanation", "")
+                            new_query = requery_llm(st.session_state.user_question_input, explanation)
 
-                    # 2) Requery LLM => rewrite user query
-                    new_query = requery_llm(
-                        st.session_state.user_question_input,
-                        explanation
-                    )
+                            # 2) Clear old states
+                            st.session_state.conversation = []
+                            st.session_state.planner_output = ""
+                            st.session_state.subtasks = []
+                            st.session_state.subtask_index = 0
+                            st.session_state.subtask_answers = []
+                            st.session_state.final_answer = ""
+                            st.session_state.hrp_json = ""
+                            st.session_state.hrp_dict = {}
+                            st.session_state.hrp_output = ""
+                            st.session_state.hyper_json = ""
+                            st.session_state.td3_output = ""
+                            st.session_state.td3_lines = []
+                            st.session_state.reporter_json = ""
+                            st.session_state.workflow_complete = False
+                            st.session_state.hrp_done = False
+                            st.session_state.hyper_done = False
+                            st.session_state.td3_done = False
+                            st.session_state.td3_run = False
 
-                    # 3) Replace the old user query with the newly rewritten one
-                    st.session_state.user_question_input = new_query
+                            # 3) Store new query
+                            st.session_state.user_question_input = new_query
 
-                    # 4) Reset all relevant states to run the entire workflow again
-                    for key in [
-                        "workflow_started", "workflow_complete",
-                        "hrp_params_decided", "hrp_done",
-                        "hyper_done", "td3_done", "td3_run"
-                    ]:
-                        st.session_state[key] = False
+                            # 4) Re-run planner right here with the *same* PDF
+                            revised_state: AgentWorkflowState = {
+                                "pdf_path": "temp_uploaded_file.pdf",
+                                "user_question": new_query,
+                                "pdf_text": st.session_state.pdf_text,
+                                "planner_output": "",
+                                "execution_result": {},
+                                "final_answer": ""
+                            }
+                            planner_state = compliance_planner_node(revised_state)
+                            st.session_state.planner_output = planner_state["planner_output"]
 
-                    st.session_state.planner_output = ""
-                    st.session_state.subtasks = []
-                    st.session_state.subtask_index = 0
-                    st.session_state.subtask_answers = []
-                    st.session_state.conversation = []
-                    st.session_state.final_answer = ""
-                    st.session_state.hrp_json = ""
-                    st.session_state.hrp_dict = {}
-                    st.session_state.hrp_output = ""
-                    st.session_state.hyper_json = ""
-                    st.session_state.td3_output = ""
-                    st.session_state.td3_lines = []
-                    st.session_state.reporter_json = ""
+                            # parse the new plan
+                            try:
+                                plan_dict = json.loads(st.session_state.planner_output)
+                                st.session_state.subtasks = plan_dict.get("subtasks", [])
+                                # Turn subtask text into question form
+                                for s in st.session_state.subtasks:
+                                    s["task"] = rewrite_subtask_as_question(s["task"])
+                                st.session_state.subtask_answers = [None] * len(st.session_state.subtasks)
+                            except Exception as e:
+                                st.session_state.conversation.append(f"Planner error: {e}")
 
-                    # 5) Trigger a full rerun so user sees the new query in the workflow
-                    st.experimental_rerun()
+                            # 5) Mark workflow as started again
+                            st.session_state.workflow_started = True
+
+                        # Force UI refresh
+                        st.rerun()
 
             except json.JSONDecodeError:
                 pass
+            except ValueError as ve:
+                st.error(str(ve))
 
 if __name__ == "__main__":
     main()
