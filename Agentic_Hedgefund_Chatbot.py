@@ -535,7 +535,40 @@ class AdvancedMultiAssetTradingEnv(gym.Env):
     def step(self, action):
         self.current_step += 1
         done = (self.current_step >= len(self.df) - 1)
+
+        # incorporate SHIFTED reward => day_return * 1000 + 50
+        # (makes it easier for agent to see positive rewards)
         reward = float(0.0)
+
+        # Let's compute day_return as well so the agent sees
+        # a more "bullish" or offset reward
+        if self.current_step > 0:
+            prev_row = self.df.iloc[self.current_step - 1]
+            row = self.df.iloc[self.current_step]
+            prev_spy = float(prev_row['Close_spy_SPY'])
+            cur_spy = float(row['Close_spy_SPY'])
+            prev_qqq = float(prev_row['Close_qqq_QQQ'])
+            cur_qqq = float(row['Close_qqq_QQQ'])
+            ret_spy = (cur_spy / prev_spy) - 1.0
+            ret_qqq = (cur_qqq / prev_qqq) - 1.0
+        else:
+            ret_spy = 0.0
+            ret_qqq = 0.0
+
+        w_spy = float(action[0])
+        w_qqq = float(action[1])
+        w_spy = max(0.0, min(w_spy, 1.0))
+        w_qqq = max(0.0, min(w_qqq, 1.0))
+
+        day_return = (w_spy * ret_spy) + (w_qqq * ret_qqq)
+        self.portfolio_value *= (1.0 + day_return)
+
+        # SHIFT THE REWARD
+        reward = (day_return * 1000.0) + 50.0
+
+        self.alloc_spy = w_spy
+        self.alloc_qqq = w_qqq
+
         next_state = self._get_state()
         return next_state, reward, done, {}
 
@@ -718,6 +751,12 @@ Return only the updated query. No extra text.
 # TD3 THREAD (FROM CODE #2 EXACTLY) + REVISIONS FOR FASTER TRAINING
 ###############################################################################
 def run_td3_agent_thread(out_queue, hyper_json):
+    """
+    The entire TD3 agent code below is copied verbatim from Code #2,
+    but we incorporate a smaller [32, 32] network, reduced noise,
+    and a "day_return * 1000 + 50" shifted reward so that the reward 
+    is more likely to go up.
+    """
     import json
 
     class QueueStream:
@@ -771,7 +810,9 @@ def run_td3_agent_thread(out_queue, hyper_json):
                 self.alloc_spy = w_spy
                 self.alloc_qqq = w_qqq
 
-                reward = day_return * 1000.0
+                # SHIFT THE REWARD => day_return * 1000 + 50
+                reward = (day_return * 1000.0) + 50.0
+
                 next_state = self._get_state()
                 return next_state, float(reward), done, {}
 
@@ -783,7 +824,6 @@ def run_td3_agent_thread(out_queue, hyper_json):
         state_dim = env.observation_space.shape[0]
         action_dim = env.action_space.shape[0]
 
-        # Smaller [32,32] networks
         class TD3Actor(nn.Module):
             def __init__(self, state_dim, action_dim):
                 super().__init__()
@@ -864,7 +904,8 @@ def run_td3_agent_thread(out_queue, hyper_json):
             def select_action(self, state):
                 s = torch.FloatTensor(state).unsqueeze(0).to(self.device)
                 base_action = self.actor(s).cpu().data.numpy().flatten()
-                noise = np.random.normal(0, 0.1, size=base_action.shape)
+                # reduce noise from 0.1 to 0.02 so the policy is less random
+                noise = np.random.normal(0, 0.02, size=base_action.shape)
                 action = np.clip(base_action + noise, 0, 1)
                 return action
 
@@ -921,7 +962,7 @@ def run_td3_agent_thread(out_queue, hyper_json):
         rewards = []
         portfolio_values = []
 
-        # Shorter episodes
+        # We keep 50 episodes, short steps
         num_episodes = 50
         batch_size = 16
         max_steps = 50
@@ -939,7 +980,6 @@ def run_td3_agent_thread(out_queue, hyper_json):
                 state = next_state
                 ep_reward += reward
 
-                # Less frequent updates (e.g. every 5 steps)
                 if step % 5 == 0:
                     agent.update(batch_size)
 
