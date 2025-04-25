@@ -401,16 +401,19 @@ def safe_download(ticker: str, start: str, end: str):
     """
     df = yf.download(ticker, start=start, end=end, auto_adjust=True, progress=False)
     if df is None or df.empty:
-        # fallback = last 1y (yfinance guarantees something if the symbol exists)
         df = yf.download(ticker, period="1y", auto_adjust=True, progress=False)
     if df is None or df.empty:
-        raise ValueError(f"yfinance returned no data for {ticker}.")  # stop early
+        raise ValueError(f"yfinance returned no data for {ticker}.")
     return df
 
 def get_preprocessed_data():
     spy_raw = safe_download("SPY", start="2025-01-01", end="2026-01-01")
     qqq_raw = safe_download("QQQ", start="2025-01-01", end="2026-01-01")
-    # ... everything else stays exactly the same ...
+
+    # For demonstration, let's limit to top ~80 rows to speed up training
+    # (so we do fewer steps per episode).
+    spy_raw = spy_raw.iloc[:80].copy()
+    qqq_raw = qqq_raw.iloc[:80].copy()
 
     def compute_SMA(series, window=14):
         return series.rolling(window=window).mean()
@@ -471,6 +474,7 @@ def get_preprocessed_data():
     spy_raw['Sentiment'] = np.random.uniform(-1, 1, size=len(spy_raw))
     spy_vix_sent = spy_raw[['VIX_proxy', 'Sentiment']].dropna()
 
+    # Also slice them to the same index range for demonstration
     spy_df = spy_df.loc[spy_vix_sent.index]
     qqq_df = qqq_df.loc[spy_vix_sent.index]
 
@@ -497,24 +501,17 @@ class AdvancedMultiAssetTradingEnv(gym.Env):
     ):
         super().__init__()
 
-        # 1) keep a single copy of the reset-indexed dataframe
         self.df = df.reset_index(drop=True)
-
         self.initial_balance = float(initial_balance)
         self.commission      = commission
         self.slippage_pct    = slippage_pct
         self.spread          = spread
 
-        # 2) action space: 2 continuous weights
         self.action_space = spaces.Box(low=0, high=1, shape=(2,), dtype=np.float32)
-
-        # 3) observation space length must match the dataframe columns
         obs_size = self.df.shape[1]
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf, shape=(obs_size,), dtype=np.float32
         )
-
-        # 4) initialise internal state
         self.reset()
 
     def reset(self):
@@ -529,12 +526,10 @@ class AdvancedMultiAssetTradingEnv(gym.Env):
 
     def _get_state(self):
         row = self.df.iloc[self.current_step].values.astype(np.float32)
-        # simple z-score normalisation per column (mean=0 std=1)
         if not hasattr(self, "_mu"):
             self._mu = self.df.mean().values
             self._sigma = self.df.std().replace(0, 1).values
         normed = (row - self._mu) / self._sigma
-        # clip extreme events
         return np.clip(normed, -10, 10)
 
     def step(self, action):
@@ -680,10 +675,6 @@ def run_hrp_inline(chatbot_answer: str, hrp_params: dict) -> str:
 # REPORTER AGENT => returns JSON with "Decision" and "Explanation"
 ###############################################################################
 def reporter_agent(user_question: str, chatbot_output: str, td3_output: str, hrp_output: str) -> str:
-    """
-    We'll produce a JSON with fields "Decision" (Complete or Rerun) 
-    and "Explanation" (the previous style's logic).
-    """
     prompt = f"""
 You are the Reporter/Recommender Agent.
 
@@ -707,10 +698,6 @@ Just valid JSON.
 # REQUERY LLM (Ensures Rerun scenario is handled)
 ###############################################################################
 def requery_llm(original_query: str, explanation: str) -> str:
-    """
-    If "reporter_agent" says we need a Rerun, this LLM rewrites the user's
-    original query by incorporating instructions/directions in the Explanation.
-    """
     prompt = f"""
 You are a "Requery" agent. The user originally asked: "{original_query}"
 
@@ -725,16 +712,14 @@ Return only the updated query. No extra text.
         raw_text = response_msg.content if hasattr(response_msg, "content") else response_msg[0].content
         return sanitize_control_chars(raw_text).strip()
     except Exception as e:
-        return original_query  # fallback if any error
+        return original_query
 
 ###############################################################################
-# TD3 THREAD (FROM CODE #2 EXACTLY)
+# TD3 THREAD (FROM CODE #2 EXACTLY) + REVISIONS FOR FASTER TRAINING
 ###############################################################################
 def run_td3_agent_thread(out_queue, hyper_json):
-    """
-    The entire TD3 agent code below is copied verbatim from Code #2.
-    """
     import json
+
     class QueueStream:
         def __init__(self, q):
             self.q = q
@@ -765,8 +750,6 @@ def run_td3_agent_thread(out_queue, hyper_json):
                 self.current_step += 1
                 done = (self.current_step >= len(self.df) - 1)
 
-                # We'll pretend each step is basically daily data,
-                # but each entire episode is ~1 month from 2025-01-01
                 if current_idx > 0:
                     prev_row = self.df.iloc[current_idx - 1]
                     row = self.df.iloc[current_idx]
@@ -780,18 +763,14 @@ def run_td3_agent_thread(out_queue, hyper_json):
                     ret_spy = 0.0
                     ret_qqq = 0.0
 
-                w_spy = float(action[0])
-                w_qqq = float(action[1])
-                w_spy = max(0.0, min(w_spy, 1.0))
-                w_qqq = max(0.0, min(w_qqq, 1.0))
+                w_spy = max(0.0, min(float(action[0]), 1.0))
+                w_qqq = max(0.0, min(float(action[1]), 1.0))
 
-                # small daily return approach
                 day_return = (w_spy * ret_spy) + (w_qqq * ret_qqq)
                 self.portfolio_value *= (1.0 + day_return)
                 self.alloc_spy = w_spy
                 self.alloc_qqq = w_qqq
 
-                # Code #2 uses simpler approach:
                 reward = day_return * 1000.0
                 next_state = self._get_state()
                 return next_state, float(reward), done, {}
@@ -804,33 +783,31 @@ def run_td3_agent_thread(out_queue, hyper_json):
         state_dim = env.observation_space.shape[0]
         action_dim = env.action_space.shape[0]
 
+        # Smaller [32,32] networks
         class TD3Actor(nn.Module):
             def __init__(self, state_dim, action_dim):
                 super().__init__()
                 self.net = nn.Sequential(
-                    nn.Linear(state_dim, 64),
+                    nn.Linear(state_dim, 32),
                     nn.ReLU(),
-                    nn.Linear(64, 64),
+                    nn.Linear(32, 32),
                     nn.ReLU(),
-                    nn.Linear(64, action_dim),
+                    nn.Linear(32, action_dim),
                     nn.Sigmoid()
                 )
-
             def forward(self, x):
                 return self.net(x)
-
 
         class TD3Critic(nn.Module):
             def __init__(self, state_dim, action_dim):
                 super().__init__()
                 self.net = nn.Sequential(
-                    nn.Linear(state_dim + action_dim, 64),
+                    nn.Linear(state_dim + action_dim, 32),
                     nn.ReLU(),
-                    nn.Linear(64, 64),
+                    nn.Linear(32, 32),
                     nn.ReLU(),
-                    nn.Linear(64, 1)
+                    nn.Linear(32, 1)
                 )
-
             def forward(self, state, action):
                 return self.net(torch.cat([state, action], dim=1))
 
@@ -882,7 +859,6 @@ def run_td3_agent_thread(out_queue, hyper_json):
                 self.noise_clip = noise_clip
                 self.policy_freq = policy_freq
                 self.device = device
-
                 self.total_it = 0
 
             def select_action(self, state):
@@ -905,9 +881,7 @@ def run_td3_agent_thread(out_queue, hyper_json):
                 done = torch.FloatTensor(done).unsqueeze(1).to(self.device)
 
                 with torch.no_grad():
-                    noise = (
-                        torch.randn_like(action) * self.policy_noise
-                    ).clamp(-self.noise_clip, self.noise_clip)
+                    noise = (torch.randn_like(action) * self.policy_noise).clamp(-self.noise_clip, self.noise_clip)
                     next_action = self.actor_target(next_state)
                     next_action = (next_action + noise).clamp(0, 1)
 
@@ -935,46 +909,48 @@ def run_td3_agent_thread(out_queue, hyper_json):
                     self.actor_optimizer.step()
 
                     for param, target_param in zip(self.actor.parameters(), self.actor_target.parameters()):
-                        target_param.data.copy_(self.tau*param.data + (1-self.tau)*target_param.data)
+                        target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
                     for param, target_param in zip(self.critic1.parameters(), self.critic1_target.parameters()):
-                        target_param.data.copy_(self.tau*param.data + (1-self.tau)*target_param.data)
+                        target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
                     for param, target_param in zip(self.critic2.parameters(), self.critic2_target.parameters()):
-                        target_param.data.copy_(self.tau*param.data + (1-self.tau)*target_param.data)
+                        target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
 
         agent = TD3Agent(state_dim, action_dim)
         print(f"TD3 Agent created. Hyperparameters:\n actor_lr={actor_lr}, critic_lr={critic_lr}, gamma={gamma}, tau={tau}\n")
 
         rewards = []
         portfolio_values = []
+
+        # Shorter episodes
         num_episodes = 50
-        batch_size = 64
+        batch_size = 16
         max_steps = 50
 
         print("Training TD3 Agent...\n")
-
-        # We'll define a "start" date for episodes: 2025-01-01
         base_date = datetime(2025, 1, 1)
 
         for ep in range(num_episodes):
             state = env.reset()
             ep_reward = 0.0
-            for _ in range(max_steps):
+            for step in range(max_steps):
                 action = agent.select_action(state)
                 next_state, reward, done, _ = env.step(action)
                 agent.replay_buffer.push(state, action, reward, next_state, float(done))
                 state = next_state
                 ep_reward += reward
-                agent.update(batch_size)
+
+                # Less frequent updates (e.g. every 5 steps)
+                if step % 5 == 0:
+                    agent.update(batch_size)
+
                 if done:
                     break
 
             rewards.append(ep_reward)
-            smoothed = float(np.mean(rewards[-10:]))
+            smoothed = float(np.mean(rewards[-5:]))
 
-            # Build the date string for each "episode"
             ep_date = base_date + relativedelta(months=ep)
             ep_date_str = ep_date.strftime("%m/%d/%Y")
-
             portfolio_values.append(float(env.portfolio_value))
 
             print(
@@ -1114,7 +1090,6 @@ def main():
                             try:
                                 plan_dict = json.loads(st.session_state.planner_output)
                                 st.session_state.subtasks = plan_dict.get("subtasks", [])
-                                # Turn each subtask into a question if type=USER
                                 for s in st.session_state.subtasks:
                                     s["task"] = rewrite_subtask_as_question(s["task"])
                                 st.session_state.subtask_answers = [None] * len(st.session_state.subtasks)
@@ -1262,7 +1237,7 @@ Else answer.
         if run_hrp_btn:
             raw_tickers = st.session_state.hrp_dict.get("tickers", [])
             cleaned = [t for t in raw_tickers if _is_valid_ticker(t)]
-            if not cleaned:  # fallback if everything invalid
+            if not cleaned:
                 cleaned = ["SPY", "EFA", "EEM", "AGG", "LQD", "GLD", "DBC"]
             st.session_state.hrp_dict["tickers"] = cleaned
             with st.spinner("Running HRP..."):
@@ -1391,16 +1366,12 @@ Else answer.
                     st.session_state.reporter_json = reporter_json
                 st.success("Reporter/Recommender Agent complete.")
 
-        # ----------------------------------------------------------------------
-        # Rerun logic with "Rerun code" button => does Requery + entire workflow
-        # ----------------------------------------------------------------------
         if st.session_state.get("reporter_json"):
             st.write("### Reporter/Recommender Output")
             st.text_area("Reporter/Recommender JSON", st.session_state.reporter_json, height=300)
 
             try:
                 raw = st.session_state.reporter_json
-                # in case there's leading/trailing text, extract the first {...}
                 m = re.search(r'\{.*\}', raw, re.S)
                 if not m:
                     raise ValueError("Reporter JSON not found.")
@@ -1410,11 +1381,9 @@ Else answer.
                     st.warning("Reporter indicates a Rerun. Click 'Rerun code' to incorporate changes.")
                     if st.button("Rerun code"):
                         with st.spinner("Re-running the entire workflow with revised query..."):
-                            # 1) Re-query LLM => get updated user query
                             explanation = rep_dict.get("Explanation", "")
                             new_query = requery_llm(st.session_state.user_question_input, explanation)
 
-                            # 2) Clear old states
                             st.session_state.conversation = []
                             st.session_state.planner_output = ""
                             st.session_state.subtasks = []
@@ -1434,10 +1403,8 @@ Else answer.
                             st.session_state.td3_done = False
                             st.session_state.td3_run = False
 
-                            # 3) Store new query
                             st.session_state.user_question_input = new_query
 
-                            # 4) Re-run planner right here with the *same* PDF
                             revised_state: AgentWorkflowState = {
                                 "pdf_path": "temp_uploaded_file.pdf",
                                 "user_question": new_query,
@@ -1449,21 +1416,17 @@ Else answer.
                             planner_state = compliance_planner_node(revised_state)
                             st.session_state.planner_output = planner_state["planner_output"]
 
-                            # parse the new plan
                             try:
                                 plan_dict = json.loads(st.session_state.planner_output)
                                 st.session_state.subtasks = plan_dict.get("subtasks", [])
-                                # Turn subtask text into question form
                                 for s in st.session_state.subtasks:
                                     s["task"] = rewrite_subtask_as_question(s["task"])
                                 st.session_state.subtask_answers = [None] * len(st.session_state.subtasks)
                             except Exception as e:
                                 st.session_state.conversation.append(f"Planner error: {e}")
 
-                            # 5) Mark workflow as started again
                             st.session_state.workflow_started = True
 
-                        # Force UI refresh
                         st.rerun()
 
             except json.JSONDecodeError:
