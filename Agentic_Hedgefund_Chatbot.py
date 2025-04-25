@@ -2,6 +2,11 @@ import os
 os.environ["STREAMLIT_SERVER_FILE_WATCHER_TYPE"] = "none"
 
 ###############################################################################
+# Define boolean to toggle background usage
+###############################################################################
+use_background = False  # Change to False if you don't want a background image
+
+###############################################################################
 # IMPORTS
 ###############################################################################
 import streamlit as st
@@ -37,10 +42,47 @@ from pydantic import BaseModel, Field, ValidationError
 ###############################################################################
 torch.set_num_threads(os.cpu_count())
 torch.set_flush_denormal(True)
+
+# Set up page config
 st.set_page_config(
     page_title="Agentic Hedge Fund Chatbot",
     layout="wide"
 )
+
+###############################################################################
+# BACKGROUND IMAGE SETUP (Feature #2)
+###############################################################################
+import base64
+
+def add_bg_from_local(image_file: str):
+    """Embed the uploaded background image behind the UI."""
+    with open(image_file, "rb") as f:
+        data = f.read()
+    encoded = base64.b64encode(data).decode()
+    st.markdown(
+        f"""
+        <style>
+        .stApp {{
+            background: url("data:image/jpeg;base64,{encoded}");
+            background-size: cover;
+            background-position: center;
+            background-repeat: no-repeat;
+        }}
+        </style>
+        """,
+        unsafe_allow_html=True
+    )
+
+# Replace 'YOUR_BACKGROUND_IMAGE.jpg' with the actual file name/path
+# of the image you uploaded:
+BACKGROUND_IMAGE_PATH = "hedge-fund.jpg"
+
+# Conditionally load background based on `use_background`
+if use_background:
+    try:
+        add_bg_from_local(BACKGROUND_IMAGE_PATH)
+    except:
+        pass  # If the file isn't there locally, won't break the rest of the app
 
 load_dotenv()
 url = os.getenv("WATSONX_URL")
@@ -122,7 +164,6 @@ The original subtask text is:
 Please rewrite it as a concise question the user can answer in one or two lines.
 Make it polite and direct.
 """
-    from langchain.schema import HumanMessage
     try:
         response_msg = llm.invoke([HumanMessage(content=prompt)])
         raw_text = response_msg.content if hasattr(response_msg, "content") else response_msg[0].content
@@ -185,8 +226,6 @@ Remember:
 - Only produce valid JSON in the exact format shown above, with no extra commentary.
 """
 
-from pydantic import BaseModel, Field
-
 class AgentWorkflowState(TypedDict):
     pdf_path: str
     user_question: str
@@ -203,7 +242,6 @@ class PlannerOutput(BaseModel):
     subtasks: List[SubTask] = Field(..., description="List of required subtasks")
 
 def stream_llm_call(prompt: str) -> str:
-    from langchain.schema import HumanMessage
     try:
         response_msg = llm.invoke([HumanMessage(content=prompt)])
         raw_text = response_msg.content if hasattr(response_msg, "content") else response_msg[0].content
@@ -217,7 +255,6 @@ def compliance_planner_node(state: AgentWorkflowState) -> AgentWorkflowState:
     final_planner_prompt = PLANNER_PROMPT_TEXT.replace("{{pdf_text}}", pdf_text)\
                                              .replace("{{user_question}}", user_question)
     raw_output = stream_llm_call(final_planner_prompt)
-    from langchain.output_parsers import PydanticOutputParser
     parser = PydanticOutputParser(pydantic_object=PlannerOutput)
     try:
         structured_output = parser.parse(raw_output)
@@ -262,8 +299,6 @@ Provide a final consolidated answer that addresses the user's question in full d
     state["final_answer"] = final_answer
     return state
 
-from langgraph.graph import END, StateGraph
-
 def build_workflow():
     wf = StateGraph(AgentWorkflowState)
     wf.set_entry_point("compliance_planner")
@@ -286,9 +321,6 @@ class HRPParams(BaseModel):
     method: str = "ward"
 
 def hrp_param_decider(chatbot_answer: str) -> dict:
-    from langchain.output_parsers import PydanticOutputParser
-    from pydantic import ValidationError
-
     parser = PydanticOutputParser(pydantic_object=HRPParams)
     prompt = f"""
 You are an HRP parameter decider.
@@ -319,8 +351,8 @@ No extra keys. No explanation. Just valid JSON.
 ###############################################################################
 def hyperparameter_decider(hrp_output: str) -> str:
     """
-    This function instructs the LLM to decide TD3 hyperparameters (actor_lr, critic_lr, gamma, tau, etc.)
-    from the HRP output.
+    This function instructs the LLM to decide TD3 hyperparameters 
+    (actor_lr, critic_lr, gamma, tau, etc.) from the HRP output.
     """
     prompt = f"""
 You are a hyperparameter decider for a TD3 trading agent.
@@ -442,7 +474,6 @@ class AdvancedMultiAssetTradingEnv(gym.Env):
         if self.current_step >= len(self.df):
             self.current_step = len(self.df) - 1
         # We'll produce a dummy 19-dim state
-        # A child class can override step() to produce real data
         return np.zeros((19,), dtype=np.float32)
 
     def step(self, action):
@@ -463,11 +494,6 @@ def run_hrp_inline(chatbot_answer: str, hrp_params: dict) -> str:
     import io
     old_stdout = sys.stdout
     log_buffer = io.StringIO()
-
-    import yfinance as yf
-    from sklearn.covariance import LedoitWolf
-    import scipy.cluster.hierarchy as sch
-    from scipy.spatial.distance import squareform
 
     sys.stdout = log_buffer
     try:
@@ -498,6 +524,10 @@ def run_hrp_inline(chatbot_answer: str, hrp_params: dict) -> str:
         print("Downloaded data from yfinance successfully.\n")
 
         daily_returns = data.pct_change().fillna(0)
+
+        from sklearn.covariance import LedoitWolf
+        import scipy.cluster.hierarchy as sch
+        from scipy.spatial.distance import squareform
 
         def compute_robust_covariance(returns):
             lw = LedoitWolf().fit(returns)
@@ -604,6 +634,30 @@ Just valid JSON.
 """
     result = stream_llm_call(prompt)
     return sanitize_control_chars(result)
+
+###############################################################################
+# REQUERY LLM (Feature #1 for "Rerun")
+###############################################################################
+def requery_llm(original_query: str, explanation: str) -> str:
+    """
+    If "reporter_agent" says we need a Rerun, this LLM rewrites the user's
+    original query by incorporating instructions/directions in the Explanation.
+    """
+    prompt = f"""
+You are a "Requery" agent. The user originally asked: "{original_query}"
+
+The 'reporter_agent' explanation is:
+{explanation}
+
+Please rewrite the user's query to incorporate these instructions. 
+Return only the updated query. No extra text.
+"""
+    try:
+        response_msg = llm.invoke([HumanMessage(content=prompt)])
+        raw_text = response_msg.content if hasattr(response_msg, "content") else response_msg[0].content
+        return sanitize_control_chars(raw_text).strip()
+    except Exception as e:
+        return original_query  # fallback if any error
 
 ###############################################################################
 # TD3 THREAD
@@ -755,7 +809,6 @@ def run_td3_agent_thread(out_queue, hyper_json):
                 self.total_it = 0
 
             def select_action(self, state):
-                # Add random exploration so the agent doesn't stagnate
                 s = torch.FloatTensor(state).unsqueeze(0).to(self.device)
                 base_action = self.actor(s).cpu().data.numpy().flatten()
                 noise = np.random.normal(0, 0.1, size=base_action.shape)
@@ -904,7 +957,6 @@ def ensure_session_state():
         st.session_state.hrp_output = ""
     if "user_question_input" not in st.session_state:
         st.session_state.user_question_input = ""
-    # Ensure hyper_json is also initialized
     if "hyper_json" not in st.session_state:
         st.session_state.hyper_json = ""
 # ------------------------------ FIX ENDS HERE -------------------------------
@@ -1230,6 +1282,47 @@ Else answer.
         if st.session_state.get("reporter_json"):
             st.write("### Reporter/Recommender Output")
             st.text_area("Reporter/Recommender JSON", st.session_state.reporter_json, height=300)
+
+            # ------------------------------ FEATURE #1: Rerun logic ------------------------------
+            # Automatically check if "Decision" == "Rerun" and if so, re-run the entire workflow
+            try:
+                rep_dict = json.loads(st.session_state.reporter_json)
+                if rep_dict.get("Decision") == "Rerun":
+                    explanation = rep_dict.get("Explanation", "")
+                    st.warning("Reporter indicates a Rerun. Rewriting user query and restarting workflow...")
+                    # Requery LLM
+                    new_query = requery_llm(
+                        st.session_state.user_question_input,
+                        explanation
+                    )
+                    st.session_state.user_question_input = new_query
+
+                    # Reset all states to run the entire workflow again
+                    for key in [
+                        "workflow_started", "workflow_complete", "hrp_params_decided",
+                        "hrp_done", "hyper_done", "td3_done", "td3_run"
+                    ]:
+                        st.session_state[key] = False
+
+                    st.session_state.planner_output = ""
+                    st.session_state.subtasks = []
+                    st.session_state.subtask_index = 0
+                    st.session_state.subtask_answers = []
+                    st.session_state.conversation = []
+                    st.session_state.final_answer = ""
+                    st.session_state.hrp_json = ""
+                    st.session_state.hrp_dict = {}
+                    st.session_state.hrp_output = ""
+                    st.session_state.hyper_json = ""
+                    st.session_state.td3_output = ""
+                    st.session_state.td3_lines = []
+                    st.session_state.reporter_json = ""
+
+                    # Trigger a full rerun so user sees the new query in the workflow
+                    st.experimental_rerun()
+
+            except json.JSONDecodeError:
+                pass  # If the JSON was invalid, just ignore.
 
 if __name__ == "__main__":
     main()

@@ -1,5 +1,6 @@
 altair
 gymnasium
+gym
 langchain
 langchain_ibm
 langchain_openai
@@ -16,3 +17,4 @@ streamlit
 torch
 typing_extensions
 yfinance
+pycryptodome
