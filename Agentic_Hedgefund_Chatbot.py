@@ -37,6 +37,10 @@ from scipy.spatial.distance import squareform
 from sklearn.covariance import LedoitWolf
 from pydantic import BaseModel, Field, ValidationError
 
+# For date manipulation in episode printouts:
+from datetime import datetime
+from dateutil.relativedelta import relativedelta
+
 ###############################################################################
 # PERFORMANCE / SETUP
 ###############################################################################
@@ -50,7 +54,7 @@ st.set_page_config(
 )
 
 ###############################################################################
-# BACKGROUND IMAGE SETUP (Feature #2)
+# BACKGROUND IMAGE SETUP
 ###############################################################################
 import base64
 
@@ -73,8 +77,6 @@ def add_bg_from_local(image_file: str):
         unsafe_allow_html=True
     )
 
-# Replace 'YOUR_BACKGROUND_IMAGE.jpg' with the actual file name/path
-# of the image you uploaded:
 BACKGROUND_IMAGE_PATH = "hedge-fund.jpg"
 
 # Conditionally load background based on `use_background`
@@ -368,8 +370,8 @@ No extra text or commentary, just valid JSON.
 # GET PREPROCESSED DATA => df_merged
 ###############################################################################
 def get_preprocessed_data():
-    spy_raw = yf.download("SPY", start="2010-01-01", end="2020-01-01", auto_adjust=True)
-    qqq_raw = yf.download("QQQ", start="2010-01-01", end="2020-01-01", auto_adjust=True)
+    spy_raw = yf.download("SPY", start="2025-01-01", end="2026-01-01", auto_adjust=True)
+    qqq_raw = yf.download("QQQ", start="2025-01-01", end="2026-01-01", auto_adjust=True)
 
     def compute_SMA(series, window=14):
         return series.rolling(window=window).mean()
@@ -424,6 +426,7 @@ def get_preprocessed_data():
         'Momentum': 'Momentum_qqq_',
         'Volatility': 'Volatility_qqq_'
     })
+
     spy_raw['VIX_proxy'] = compute_vix(spy_raw['Close'])
     np.random.seed(42)
     spy_raw['Sentiment'] = np.random.uniform(-1, 1, size=len(spy_raw))
@@ -484,8 +487,11 @@ class AdvancedMultiAssetTradingEnv(gym.Env):
         return next_state, reward, done, {}
 
     def render(self):
-        print(f"Step: {self.current_step}, Value: {self.portfolio_value:.2f}, "
-              f"SPY: {self.alloc_spy:.2f}, QQQ: {self.alloc_qqq:.2f}")
+        print(
+            f"Step: {self.current_step}, "
+            f"Value: {self.portfolio_value:.2f}, "
+            f"SPY: {self.alloc_spy:.2f}, QQQ: {self.alloc_qqq:.2f}"
+        )
 
 ###############################################################################
 # HRP RUN
@@ -504,8 +510,12 @@ def run_hrp_inline(chatbot_answer: str, hrp_params: dict) -> str:
         if not tickers_list or len(tickers_list) == 0:
             tickers_list = ["SPY","EFA","EEM","AGG","LQD","GLD","DBC"]
 
-        start_date = hrp_params.get("start_date", "2010-01-01")
-        end_date = hrp_params.get("end_date", "2023-01-01")
+        start_date = hrp_params.get("start_date", "2025-01-01")
+        if start_date < "2025-01-01":
+            start_date = "2025-01-01"
+        end_date = hrp_params.get("end_date", "2026-01-01")
+        if end_date < start_date:
+            end_date = "2026-01-01"
         method = hrp_params.get("method", "ward")
         max_w = hrp_params.get("max_weight", None)
 
@@ -515,8 +525,8 @@ def run_hrp_inline(chatbot_answer: str, hrp_params: dict) -> str:
         print("Attempting to download data from yfinance for these tickers...")
         data = yf.download(tickers_list, start=start_date, end=end_date, auto_adjust=True)
         if data is None or data.empty:
-            print("No data found with user-chosen dates. Trying fallback: 2010-01-01..2023-01-01")
-            data = yf.download(tickers_list, start="2010-01-01", end="2023-01-01", auto_adjust=True)
+            print("No data found with user-chosen or enforced dates. Trying fallback: 2025-01-01..2026-01-01")
+            data = yf.download(tickers_list, start="2025-01-01", end="2026-01-01", auto_adjust=True)
             if data is None or data.empty:
                 raise ValueError("No data returned from yfinance after fallback either!")
         data = data.ffill().dropna()
@@ -636,7 +646,7 @@ Just valid JSON.
     return sanitize_control_chars(result)
 
 ###############################################################################
-# REQUERY LLM (Feature #1 for "Rerun")
+# REQUERY LLM (Ensures Rerun scenario is handled)
 ###############################################################################
 def requery_llm(original_query: str, explanation: str) -> str:
     """
@@ -694,6 +704,8 @@ def run_td3_agent_thread(out_queue, hyper_json):
                 self.current_step += 1
                 done = (self.current_step >= len(self.df) - 1)
 
+                # We'll pretend each step is basically daily data,
+                # but each entire episode is ~1 month from 2025-01-01
                 if current_idx > 0:
                     prev_row = self.df.iloc[current_idx - 1]
                     row = self.df.iloc[current_idx]
@@ -874,6 +886,10 @@ def run_td3_agent_thread(out_queue, hyper_json):
         max_steps = len(df_merged) - 1
 
         print("Training TD3 Agent...\n")
+
+        # We'll define a "start" date for episodes: 2025-01-01
+        base_date = datetime(2025, 1, 1)
+
         for ep in range(num_episodes):
             state = env.reset()
             ep_reward = 0.0
@@ -889,9 +905,20 @@ def run_td3_agent_thread(out_queue, hyper_json):
 
             rewards.append(ep_reward)
             smoothed = float(np.mean(rewards[-10:]))
+
+            # Build the date string for each "episode"
+            ep_date = base_date + relativedelta(months=ep)
+            ep_date_str = ep_date.strftime("%m/%d/%Y")
+
             portfolio_values.append(float(env.portfolio_value))
 
-            print(f"Episode {ep+1}/{num_episodes}, Reward: {ep_reward:.4f}, Smoothed: {smoothed:.4f}, Final Portfolio: ${env.portfolio_value:.2f}\n")
+            print(
+                f"Episode (Month) {ep+1}/{num_episodes} ({ep_date_str}), "
+                f"Reward: {ep_reward:.4f}, "
+                f"Smoothed: {smoothed:.4f}, "
+                f"Final Portfolio: ${env.portfolio_value:.2f}\n"
+            )
+
             metrics_update = json.dumps({
                 "smoothed_rewards": [float(x) for x in rewards],
                 "portfolio_values": [float(x) for x in portfolio_values]
@@ -1279,28 +1306,35 @@ Else answer.
                     st.session_state.reporter_json = reporter_json
                 st.success("Reporter/Recommender Agent complete.")
 
+        # ----------------------------------------------------------------------
+        # Rerun logic: If the reporter says "Rerun", we do a Requery => full reset
+        # ----------------------------------------------------------------------
         if st.session_state.get("reporter_json"):
             st.write("### Reporter/Recommender Output")
             st.text_area("Reporter/Recommender JSON", st.session_state.reporter_json, height=300)
 
-            # ------------------------------ FEATURE #1: Rerun logic ------------------------------
-            # Automatically check if "Decision" == "Rerun" and if so, re-run the entire workflow
+            # Parse the JSON
             try:
                 rep_dict = json.loads(st.session_state.reporter_json)
                 if rep_dict.get("Decision") == "Rerun":
+                    # 1) Grab the explanation
                     explanation = rep_dict.get("Explanation", "")
                     st.warning("Reporter indicates a Rerun. Rewriting user query and restarting workflow...")
-                    # Requery LLM
+
+                    # 2) Requery LLM => rewrite user query
                     new_query = requery_llm(
                         st.session_state.user_question_input,
                         explanation
                     )
+
+                    # 3) Replace the old user query with the newly rewritten one
                     st.session_state.user_question_input = new_query
 
-                    # Reset all states to run the entire workflow again
+                    # 4) Reset all relevant states to run the entire workflow again
                     for key in [
-                        "workflow_started", "workflow_complete", "hrp_params_decided",
-                        "hrp_done", "hyper_done", "td3_done", "td3_run"
+                        "workflow_started", "workflow_complete",
+                        "hrp_params_decided", "hrp_done",
+                        "hyper_done", "td3_done", "td3_run"
                     ]:
                         st.session_state[key] = False
 
@@ -1318,11 +1352,11 @@ Else answer.
                     st.session_state.td3_lines = []
                     st.session_state.reporter_json = ""
 
-                    # Trigger a full rerun so user sees the new query in the workflow
+                    # 5) Trigger a full rerun so user sees the new query in the workflow
                     st.experimental_rerun()
 
             except json.JSONDecodeError:
-                pass  # If the JSON was invalid, just ignore.
+                pass
 
 if __name__ == "__main__":
     main()
