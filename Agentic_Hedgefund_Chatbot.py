@@ -808,26 +808,29 @@ def run_td3_agent_thread(out_queue, hyper_json):
             def __init__(self, state_dim, action_dim):
                 super().__init__()
                 self.net = nn.Sequential(
-                    nn.Linear(state_dim, 256),
+                    nn.Linear(state_dim, 64),
                     nn.ReLU(),
-                    nn.Linear(256, 256),
+                    nn.Linear(64, 64),
                     nn.ReLU(),
-                    nn.Linear(256, action_dim),
+                    nn.Linear(64, action_dim),
                     nn.Sigmoid()
                 )
+
             def forward(self, x):
                 return self.net(x)
+
 
         class TD3Critic(nn.Module):
             def __init__(self, state_dim, action_dim):
                 super().__init__()
                 self.net = nn.Sequential(
-                    nn.Linear(state_dim + action_dim, 256),
+                    nn.Linear(state_dim + action_dim, 64),
                     nn.ReLU(),
-                    nn.Linear(256, 256),
+                    nn.Linear(64, 64),
                     nn.ReLU(),
-                    nn.Linear(256, 1)
+                    nn.Linear(64, 1)
                 )
+
             def forward(self, state, action):
                 return self.net(torch.cat([state, action], dim=1))
 
