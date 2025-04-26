@@ -84,7 +84,7 @@ if use_background:
     try:
         add_bg_from_local(BACKGROUND_IMAGE_PATH)
     except:
-        pass  # If the file isn't there locally, won't break the rest of the app
+        pass
 
 load_dotenv()
 url = os.getenv("WATSONX_URL")
@@ -139,7 +139,7 @@ if apikey and apikey.strip():
         params     = parameters,
     )
 else:
-    llm_llama = None  # <-  just a placeholder; never used
+    llm_llama = None  # <- Just a placeholder; never used
 
 # We'll use GPT-4o by default:
 llm = llm_chat_gpt
@@ -221,8 +221,8 @@ Context Provided:
 Your Objective:
 1) Figure out each step or piece of information required to provide a complete, 
    accurate answer.
-2) If the needed information is already available in the context (the PDF text 
-   or the user’s previous answers), you can answer with an "LLM" subtask.
+2) If the needed information is already available in the context (the PDF text + 
+   any known user inputs), you can answer with an "LLM" subtask.
 3) If any piece of information is missing—i.e., it is not in the PDF text or 
    the user’s previous answers—then you must not guess or assume. Instead, 
    you must create a "USER" subtask to explicitly ask the user for that 
@@ -344,7 +344,7 @@ class HRPParams(BaseModel):
     start_date: str = "2010-01-01"
     end_date: str = "2023-01-01"
     max_weight: float = None
-    method: str = "ward"
+    method: str = "complete"
 
 def hrp_param_decider(chatbot_answer: str) -> dict:
     parser = PydanticOutputParser(pydantic_object=HRPParams)
@@ -410,8 +410,7 @@ def get_preprocessed_data():
     spy_raw = safe_download("SPY", start="2025-01-01", end="2026-01-01")
     qqq_raw = safe_download("QQQ", start="2025-01-01", end="2026-01-01")
 
-    # For demonstration, let's limit to top ~80 rows to speed up training
-    # (so we do fewer steps per episode).
+    # For demonstration, let's limit to top ~80 rows
     spy_raw = spy_raw.iloc[:80].copy()
     qqq_raw = qqq_raw.iloc[:80].copy()
 
@@ -447,6 +446,7 @@ def get_preprocessed_data():
         df['Volatility'] = compute_volatility(df['Close'])
         return df.dropna()
 
+    # FIX: simply use spy_raw[['Close']] & qqq_raw[['Close']] to get single-col DFS
     spy_df = add_technical_indicators(spy_raw[['Close']].copy())
     qqq_df = add_technical_indicators(qqq_raw[['Close']].copy())
 
@@ -474,7 +474,6 @@ def get_preprocessed_data():
     spy_raw['Sentiment'] = np.random.uniform(-1, 1, size=len(spy_raw))
     spy_vix_sent = spy_raw[['VIX_proxy', 'Sentiment']].dropna()
 
-    # Also slice them to the same index range for demonstration
     spy_df = spy_df.loc[spy_vix_sent.index]
     qqq_df = qqq_df.loc[spy_vix_sent.index]
 
@@ -535,13 +534,8 @@ class AdvancedMultiAssetTradingEnv(gym.Env):
     def step(self, action):
         self.current_step += 1
         done = (self.current_step >= len(self.df) - 1)
-
-        # incorporate SHIFTED reward => day_return * 1000 + 50
-        # (makes it easier for agent to see positive rewards)
         reward = float(0.0)
 
-        # Let's compute day_return as well so the agent sees
-        # a more "bullish" or offset reward
         if self.current_step > 0:
             prev_row = self.df.iloc[self.current_step - 1]
             row = self.df.iloc[self.current_step]
@@ -562,8 +556,6 @@ class AdvancedMultiAssetTradingEnv(gym.Env):
 
         day_return = (w_spy * ret_spy) + (w_qqq * ret_qqq)
         self.portfolio_value *= (1.0 + day_return)
-
-        # SHIFT THE REWARD
         reward = (day_return * 1000.0) + 50.0
 
         self.alloc_spy = w_spy
@@ -602,7 +594,7 @@ def run_hrp_inline(chatbot_answer: str, hrp_params: dict) -> str:
         end_date = hrp_params.get("end_date", "2026-01-01")
         if end_date < start_date:
             end_date = "2026-01-01"
-        method = hrp_params.get("method", "ward")
+        method = hrp_params.get("method", "complete")
         max_w = hrp_params.get("max_weight", None)
 
         print(f"HRP params (from chatbot-decided JSON): {hrp_params}\n")
@@ -748,14 +740,16 @@ Return only the updated query. No extra text.
         return original_query
 
 ###############################################################################
-# TD3 THREAD (FROM CODE #2 EXACTLY) + REVISIONS FOR FASTER TRAINING
+# TD3 THREAD (FROM CODE #2 EXACTLY) but with smaller network, fewer episodes
 ###############################################################################
 def run_td3_agent_thread(out_queue, hyper_json):
     """
-    The entire TD3 agent code below is copied verbatim from Code #2,
-    but we incorporate a smaller [32, 32] network, reduced noise,
-    and a "day_return * 1000 + 50" shifted reward so that the reward 
-    is more likely to go up.
+    The entire TD3 agent code is the same except for the changes below:
+      - Actor/Critic layers: from [32, 32] down to [16, 16].
+      - Replay buffer size: from 1_000_000 down to 10_000.
+      - Fewer episodes: 10
+      - Fewer steps per episode: 30
+      - Smaller batch size: 8
     """
     import json
 
@@ -827,12 +821,13 @@ def run_td3_agent_thread(out_queue, hyper_json):
         class TD3Actor(nn.Module):
             def __init__(self, state_dim, action_dim):
                 super().__init__()
+                # Reduced hidden layers from 32->32 to 16->16
                 self.net = nn.Sequential(
-                    nn.Linear(state_dim, 32),
+                    nn.Linear(state_dim, 16),
                     nn.ReLU(),
-                    nn.Linear(32, 32),
+                    nn.Linear(16, 16),
                     nn.ReLU(),
-                    nn.Linear(32, action_dim),
+                    nn.Linear(16, action_dim),
                     nn.Sigmoid()
                 )
             def forward(self, x):
@@ -841,12 +836,13 @@ def run_td3_agent_thread(out_queue, hyper_json):
         class TD3Critic(nn.Module):
             def __init__(self, state_dim, action_dim):
                 super().__init__()
+                # Reduced hidden layers from 32->32 to 16->16
                 self.net = nn.Sequential(
-                    nn.Linear(state_dim + action_dim, 32),
+                    nn.Linear(state_dim + action_dim, 16),
                     nn.ReLU(),
-                    nn.Linear(32, 32),
+                    nn.Linear(16, 16),
                     nn.ReLU(),
-                    nn.Linear(32, 1)
+                    nn.Linear(16, 1)
                 )
             def forward(self, state, action):
                 return self.net(torch.cat([state, action], dim=1))
@@ -892,7 +888,8 @@ def run_td3_agent_thread(out_queue, hyper_json):
                 self.critic1_optimizer = optim.Adam(self.critic1.parameters(), lr=critic_lr)
                 self.critic2_optimizer = optim.Adam(self.critic2.parameters(), lr=critic_lr)
 
-                self.replay_buffer = ReplayBuffer(1_000_000)
+                # Reduced replay buffer to 10,000
+                self.replay_buffer = ReplayBuffer(10_000)
                 self.gamma = gamma
                 self.tau = tau
                 self.policy_noise = policy_noise
@@ -904,7 +901,6 @@ def run_td3_agent_thread(out_queue, hyper_json):
             def select_action(self, state):
                 s = torch.FloatTensor(state).unsqueeze(0).to(self.device)
                 base_action = self.actor(s).cpu().data.numpy().flatten()
-                # reduce noise from 0.1 to 0.02 so the policy is less random
                 noise = np.random.normal(0, 0.02, size=base_action.shape)
                 action = np.clip(base_action + noise, 0, 1)
                 return action
@@ -962,10 +958,9 @@ def run_td3_agent_thread(out_queue, hyper_json):
         rewards = []
         portfolio_values = []
 
-        # We keep 50 episodes, short steps
-        num_episodes = 50
-        batch_size = 16
-        max_steps = 50
+        num_episodes = 10
+        batch_size = 8
+        max_steps = 30
 
         print("Training TD3 Agent...\n")
         base_date = datetime(2025, 1, 1)
@@ -1014,11 +1009,8 @@ def run_td3_agent_thread(out_queue, hyper_json):
         sys.stdout = original_stdout
         out_queue.put(None)
 
-# ------------------------------ FIX STARTS HERE ------------------------------
+###############################################################################
 def ensure_session_state():
-    """
-    Initializes any session_state attributes that might be missing.
-    """
     if "workflow_started" not in st.session_state:
         st.session_state.workflow_started = False
     if "workflow_complete" not in st.session_state:
@@ -1067,7 +1059,6 @@ def ensure_session_state():
         st.session_state.user_question_input = ""
     if "hyper_json" not in st.session_state:
         st.session_state.hyper_json = ""
-# ------------------------------ FIX ENDS HERE -------------------------------
 
 def main():
     ensure_session_state()
@@ -1176,11 +1167,13 @@ Else answer.
 """
                     with st.spinner("Executing LLM subtask..."):
                         llm_response = stream_llm_call(prompt_llm).strip()
+
                     if llm_response.upper().startswith("INSUFFICIENT"):
                         missing_q_raw = llm_response.split(":", 1)[1].strip() if ":" in llm_response else ""
                         if not missing_q_raw:
                             missing_q_raw = "Could you please provide the missing information?"
-                        missing_q = rewrite_subtask_as_question(missing_q_raw)
+                        missing_q = missing_q_raw
+
                         insert_pos = st.session_state.subtask_index + 1
                         st.session_state.subtasks.insert(
                             insert_pos,
@@ -1204,7 +1197,7 @@ Else answer.
                     st.rerun()
 
                 elif subtask_type == "USER":
-                    question_text = rewrite_subtask_as_question(current["task"])
+                    question_text = current["task"]
                     st.write(f"[Subtask #{st.session_state.subtask_index+1} - USER]\n{question_text}\n")
                     user_response = st.text_input("Your Answer:", key=f"user_ans_{st.session_state.subtask_index}")
                     if st.button("Submit Answer", key=f"submit_{st.session_state.subtask_index}"):
