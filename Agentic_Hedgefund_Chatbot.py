@@ -446,7 +446,7 @@ def get_preprocessed_data():
         df['Volatility'] = compute_volatility(df['Close'])
         return df.dropna()
 
-    # FIX: simply use spy_raw[['Close']] & qqq_raw[['Close']] to get single-col DFS
+    # Single-col DFs
     spy_df = add_technical_indicators(spy_raw[['Close']].copy())
     qqq_df = add_technical_indicators(qqq_raw[['Close']].copy())
 
@@ -750,6 +750,7 @@ def run_td3_agent_thread(out_queue, hyper_json):
       - Fewer episodes: 10
       - Fewer steps per episode: 30
       - Smaller batch size: 8
+      - **Changed default hyperparameters** to encourage increasing rewards.
     """
     import json
 
@@ -767,15 +768,16 @@ def run_td3_agent_thread(out_queue, hyper_json):
     try:
         try:
             params = json.loads(hyper_json)
-            actor_lr = float(params.get("actor_lr", 1e-4))
+            # If user didn't specify, we default to these more "growth-friendly" hyperparams
+            actor_lr = float(params.get("actor_lr", 1e-3))
             critic_lr = float(params.get("critic_lr", 1e-3))
-            gamma = float(params.get("gamma", 0.99))
-            tau = float(params.get("tau", 0.005))
+            gamma = float(params.get("gamma", 0.998))
+            tau = float(params.get("tau", 0.05))
         except:
-            actor_lr = 1e-4
+            actor_lr = 1e-3
             critic_lr = 1e-3
-            gamma = 0.99
-            tau = 0.005
+            gamma = 0.998
+            tau = 0.05
 
         class EnhancedTradingEnv(AdvancedMultiAssetTradingEnv):
             def step(self, action):
@@ -821,7 +823,6 @@ def run_td3_agent_thread(out_queue, hyper_json):
         class TD3Actor(nn.Module):
             def __init__(self, state_dim, action_dim):
                 super().__init__()
-                # Reduced hidden layers from 32->32 to 16->16
                 self.net = nn.Sequential(
                     nn.Linear(state_dim, 16),
                     nn.ReLU(),
@@ -836,7 +837,6 @@ def run_td3_agent_thread(out_queue, hyper_json):
         class TD3Critic(nn.Module):
             def __init__(self, state_dim, action_dim):
                 super().__init__()
-                # Reduced hidden layers from 32->32 to 16->16
                 self.net = nn.Sequential(
                     nn.Linear(state_dim + action_dim, 16),
                     nn.ReLU(),
@@ -868,9 +868,9 @@ def run_td3_agent_thread(out_queue, hyper_json):
                 critic_lr=critic_lr,
                 gamma=gamma,
                 tau=tau,
-                policy_noise=0.2,
-                noise_clip=0.5,
-                policy_freq=2,
+                policy_noise=0.1,
+                noise_clip=0.2,
+                policy_freq=1,
                 device='cpu'
             ):
                 self.actor = TD3Actor(state_dim, action_dim).to(device)
@@ -888,7 +888,6 @@ def run_td3_agent_thread(out_queue, hyper_json):
                 self.critic1_optimizer = optim.Adam(self.critic1.parameters(), lr=critic_lr)
                 self.critic2_optimizer = optim.Adam(self.critic2.parameters(), lr=critic_lr)
 
-                # Reduced replay buffer to 10,000
                 self.replay_buffer = ReplayBuffer(10_000)
                 self.gamma = gamma
                 self.tau = tau
@@ -901,7 +900,8 @@ def run_td3_agent_thread(out_queue, hyper_json):
             def select_action(self, state):
                 s = torch.FloatTensor(state).unsqueeze(0).to(self.device)
                 base_action = self.actor(s).cpu().data.numpy().flatten()
-                noise = np.random.normal(0, 0.02, size=base_action.shape)
+                # Lower noise than default to help stable learning
+                noise = np.random.normal(0, 0.01, size=base_action.shape)
                 action = np.clip(base_action + noise, 0, 1)
                 return action
 
@@ -939,6 +939,7 @@ def run_td3_agent_thread(out_queue, hyper_json):
                 loss_q2.backward()
                 self.critic2_optimizer.step()
 
+                # Update actor more often (policy_freq=1)
                 if self.total_it % self.policy_freq == 0:
                     actor_loss = -self.critic1(state, self.actor(state)).mean()
                     self.actor_optimizer.zero_grad()
