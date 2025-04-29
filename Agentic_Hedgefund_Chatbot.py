@@ -398,12 +398,16 @@ No extra text or commentary, just valid JSON.
 def safe_download(ticker: str, start: str, end: str):
     """
     yfinance sometimes returns an empty DataFrame; try a fallback period.
+    **FIX**: Flatten multi-level columns (if any) so that we have a single-level DataFrame.
     """
     df = yf.download(ticker, start=start, end=end, auto_adjust=True, progress=False)
     if df is None or df.empty:
         df = yf.download(ticker, period="1y", auto_adjust=True, progress=False)
-    if df is None or df.empty:
-        raise ValueError(f"yfinance returned no data for {ticker}.")
+        if df is None or df.empty:
+            raise ValueError(f"yfinance returned no data for {ticker}.")
+    # Flatten columns if there's a multi-index (can happen on fallback)
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.droplevel(0)
     return df
 
 def get_preprocessed_data():
