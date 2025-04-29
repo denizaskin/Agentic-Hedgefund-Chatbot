@@ -128,13 +128,13 @@ If you get a "No module named yfinance" error, please try:
 
 ## Key Components
 
-**Disabling File Watchers**
+### **Disabling File Watchers**
 ```bash
 os.environ["STREAMLIT_SERVER_FILE_WATCHER_TYPE"] = "none"
 ```
 Prevents file-watch overhead on Python 3.12 + Torch within Streamlit.
 
-**Streamlit App Structure**
+### **Streamlit App Structure**
 ```bash
 The main() function in the code orchestrates:
   - File upload and question input.
@@ -143,7 +143,7 @@ The main() function in the code orchestrates:
   - HRP parameter picking, portfolio construction, and TD3 agent training.
   - Reporter that generates a recommendation JSON.
 ```
-**LLM Setup**
+### **LLM Setup**
 ```bash
 from langchain_ibm import ChatWatsonx
 from langchain_openai import ChatOpenAI
@@ -151,7 +151,7 @@ from langchain_openai import ChatOpenAI
 	- Uses langchain-style wrappers for IBM Watsonx and GPT-4o.
 	- Adjustable prompts in the code for custom logic.
 ```
-**PDF Reading**
+### **PDF Reading**
 ```bash
 @st.cache_data
 def read_pdf_text(file_path: str) -> str:
@@ -160,12 +160,12 @@ def read_pdf_text(file_path: str) -> str:
 	- Uses PyPDF2 to extract text and caches the result for performance.
 ```
 
-**Planner and Execution Nodes**
+### **Planner and Execution Nodes**
 ```bash
 	- Planner: Generates a JSON structure of subtasks (some to be answered by the LLM, others by the user).
 	- Executor: For each subtask, it either handles LLM calls or asks the user for missing data.
 ```
-**Hierarchical Risk Parity (HRP)**
+### **Hierarchical Risk Parity (HRP)**
 ```bash
 def run_hrp_inline(chatbot_answer: str, hrp_params: dict) -> str:
     ...
@@ -173,7 +173,7 @@ def run_hrp_inline(chatbot_answer: str, hrp_params: dict) -> str:
 	- Fetches price data from Yahoo Finance.
 	- Computes a robust covariance using LedoitWolf, then runs hierarchical clustering to get final portfolio weights.
 ```
-**TD3 Reinforcement Learning**
+### **TD3 Reinforcement Learning**
 ```bash
 def run_td3_agent_thread(out_queue, hyper_json):
     ...
@@ -181,7 +181,7 @@ def run_td3_agent_thread(out_queue, hyper_json):
 	- A background thread that trains a TD3 agent in an AdvancedMultiAssetTradingEnv.
 	- Streams output to the UI line by line so users can see training progress.
 ```
-**Reporter / Recommender**
+### **Reporter / Recommender**
 ```bash
 def reporter_agent(user_question: str, chatbot_output: str, td3_output: str, hrp_output: str) -> str:
     ...
