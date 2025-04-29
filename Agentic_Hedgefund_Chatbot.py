@@ -398,16 +398,23 @@ No extra text or commentary, just valid JSON.
 def safe_download(ticker: str, start: str, end: str):
     """
     yfinance sometimes returns an empty DataFrame; try a fallback period.
-    **FIX**: Flatten multi-level columns (if any) so that we have a single-level DataFrame.
+    Flatten multi-level columns. Also rename 'Adj Close' to 'Close' if needed.
+    Drop top-level named 'Ticker' if it exists.
     """
     df = yf.download(ticker, start=start, end=end, auto_adjust=True, progress=False)
     if df is None or df.empty:
         df = yf.download(ticker, period="1y", auto_adjust=True, progress=False)
         if df is None or df.empty:
             raise ValueError(f"yfinance returned no data for {ticker}.")
-    # Flatten columns if there's a multi-index (can happen on fallback)
+    # If there's a MultiIndex with name='Ticker', drop that level
+    if isinstance(df.columns, pd.MultiIndex) and "Ticker" in df.columns.names:
+        df.columns = df.columns.droplevel("Ticker")
+    # If there's still a multi-level index, flatten it
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.droplevel(0)
+    # Rename 'Adj Close' to 'Close' if "Close" not present
+    if "Close" not in df.columns and "Adj Close" in df.columns:
+        df.rename(columns={"Adj Close": "Close"}, inplace=True)
     return df
 
 def get_preprocessed_data():
@@ -791,7 +798,7 @@ def run_td3_agent_thread(out_queue, hyper_json):
 
                 if current_idx > 0:
                     prev_row = self.df.iloc[current_idx - 1]
-                    row = self.df.iloc[current_idx]
+                    row = self.df.iloc[self.current_step]
                     prev_spy = float(prev_row['Close_spy_SPY'])
                     cur_spy = float(row['Close_spy_SPY'])
                     prev_qqq = float(prev_row['Close_qqq_QQQ'])
