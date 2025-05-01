@@ -237,16 +237,10 @@ Make it polite and direct.
 from langgraph.graph import END, StateGraph
 
 PLANNER_PROMPT_TEXT = """
-You are a question answering agent whose task is to look at a PDF document which
-is an official Investment Statement for the Base Canada Pension Plan (bCPP) and 
-the Additional Canada Pension Plan (aCPP) investment portfolios. It details the 
-key investment objectives, policies, return expectations, risk management 
-strategies, asset allocation methods, valuation techniques, and sustainable 
-investing practices that guide how CPP Investments manages these 
-long-horizon portfolios. Essentially, it sets the framework for ensuring the CPP 
-remains self-sustaining while balancing risk and return in line with legislative 
-mandates and stakeholder interests., and your task is to create a sequence of 
-subtasks needed to address the user’s question thoroughly.
+You are a question‑answering agent whose task is to examine an uploaded PDF that relates to investing — for example, a simplified prospectus, company prospectus, investment policy statement, annual or quarterly report, strategy white‑paper, or any similar document.  
+Such documents typically describe objectives, strategies, asset allocation frameworks, product structures, risk/return characteristics, fees, governance, historical performance, sustainability considerations and other material required by investors or advisers.  
+
+Your goal is to break down the user’s question into a clear sequence of subtasks so that the information in the PDF — together with any facts the user has already supplied — can be used to construct a complete, accurate response.
 
 Context Provided:
 1) PDF Content: {{pdf_text}}
@@ -921,7 +915,7 @@ Return only the updated query. No extra text.
 ###############################################################################
 # TD3 THREAD (FROM CODE #2 EXACTLY) but with smaller network, fewer episodes
 ###############################################################################
-def run_td3_agent_thread(out_queue, hyper_json):
+def run_td3_agent_thread(out_queue, hyper_json, hrp_weights_json):
     """
     TD3 training thread – re‑tuned so that the agent can actually learn on the
     tiny demo dataset while still staying light enough for Streamlit‑Free.
@@ -961,8 +955,37 @@ def run_td3_agent_thread(out_queue, hyper_json):
         except Exception:
             actor_lr, critic_lr, gamma, tau = 1e-3, 1e-3, 0.99, 0.01
 
+        # ---------- baseline weights from HRP (if provided) ----------
+        try:
+            hrp_w = json.loads(hrp_weights_json or "{}")
+        except Exception:
+            hrp_w = {}
+        base_spy = float(hrp_w.get("SPY", 0.5))
+        base_qqq = float(hrp_w.get("QQQ", 0.5))
+        total = base_spy + base_qqq
+        if total <= 0:       # fall back if both are zero
+            base_spy, base_qqq = 0.5, 0.5
+            total = 1.0
+        base_spy /= total
+        base_qqq /= total
+
         # ---------- minimal env wrapper (unchanged dynamics, new reward) ----------
         class EnhancedTradingEnv(AdvancedMultiAssetTradingEnv):
+            def __init__(self, df, init_spy: float, init_qqq: float):
+                # Store the HRP‑suggested baseline allocations *before* the parent
+                # constructor invokes .reset(), because .reset() will immediately
+                # reference these attributes in the subclass override.
+                self.init_spy = float(init_spy)
+                self.init_qqq = float(init_qqq)
+                super().__init__(df)
+
+            def reset(self):
+                super().reset()
+                # start from the HRP‑suggested allocation
+                self.alloc_spy = self.init_spy
+                self.alloc_qqq = self.init_qqq
+                return self._get_state()
+
             def step(self, action):
                 cur_idx = self.current_step
                 self.current_step += 1
@@ -981,19 +1004,17 @@ def run_td3_agent_thread(out_queue, hyper_json):
 
                 day_ret = (w_spy * ret_spy) + (w_qqq * ret_qqq)
                 self.portfolio_value *= (1.0 + day_ret)
-
-                # remove the previous constant +50 – let reward be pure PnL signal
-                reward = day_ret * 1_000.0     # scale to nice ≈[‑20, +20] range
+                reward = day_ret * 1_000.0  # pure PnL signal
 
                 self.alloc_spy, self.alloc_qqq = w_spy, w_qqq
                 return self._get_state(), float(reward), done, {}
 
         print("Environment initialized. Ready for training.\n")
-        env = EnhancedTradingEnv(df_merged)
+        env = EnhancedTradingEnv(df_merged, base_spy, base_qqq)
         env.reset()
         env.render()
 
-        state_dim  = 8
+        state_dim  = env.observation_space.shape[0]
         action_dim = env.action_space.shape[0]
 
         # ---------- tiny TD3 networks ----------
@@ -1001,9 +1022,9 @@ def run_td3_agent_thread(out_queue, hyper_json):
             def __init__(self, s_dim, a_dim):
                 super().__init__()
                 self.net = nn.Sequential(
-                    nn.Linear(s_dim, 32), nn.ReLU(),
-                    nn.Linear(32, 32),   nn.ReLU(),
-                    nn.Linear(32, a_dim), nn.Sigmoid()
+                    nn.Linear(s_dim, 8), nn.ReLU(),
+                    nn.Linear(8, 8),   nn.ReLU(),
+                    nn.Linear(8, a_dim), nn.Sigmoid()
                 )
             def forward(self, x): return self.net(x)
 
@@ -1011,9 +1032,9 @@ def run_td3_agent_thread(out_queue, hyper_json):
             def __init__(self, s_dim, a_dim):
                 super().__init__()
                 self.net = nn.Sequential(
-                    nn.Linear(s_dim + a_dim, 32), nn.ReLU(),
-                    nn.Linear(32, 32),            nn.ReLU(),
-                    nn.Linear(32, 1)
+                    nn.Linear(s_dim + a_dim, 8), nn.ReLU(),
+                    nn.Linear(8, 8),            nn.ReLU(),
+                    nn.Linear(8, 1)
                 )
             def forward(self, s, a): return self.net(torch.cat([s, a], dim=1))
 
@@ -1457,9 +1478,19 @@ Else answer.
                 st.session_state.td3_run = True
                 st.session_state.td3_output = ""
                 st.session_state.td3_queue = queue.Queue()
+                # ---- Build HRP weights dict (only SPY / QQQ are needed) ----
+                hrp_lines = st.session_state.hrp_output.splitlines()
+                weight_dict = {}
+                for ln in hrp_lines:
+                    m = re.match(r"^([A-Z\.\\-]+).*?:\s+(\d+\.\d+)", ln.strip())
+                    if m:
+                        weight_dict[m.group(1)] = float(m.group(2))
+                hrp_weights_json = json.dumps(weight_dict)
                 st.session_state.td3_thread = threading.Thread(
                     target=run_td3_agent_thread,
-                    args=(st.session_state.td3_queue, st.session_state.hyper_json)
+                    args=(st.session_state.td3_queue,
+                          st.session_state.hyper_json,
+                          hrp_weights_json)
                 )
                 st.session_state.td3_thread.start()
 
