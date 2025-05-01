@@ -766,7 +766,24 @@ def run_hrp_inline(chatbot_answer: str, hrp_params: dict) -> str:
             print("No data found with user-chosen or enforced dates. Trying fallback: 2025-01-01..2026-01-01")
             data = yf.download(tickers_list, start="2025-01-01", end="2026-01-01", auto_adjust=True)
             if data is None or data.empty:
-                raise ValueError("No data returned from yfinance after fallback either!")
+                # ------------------------------------------------------------
+                # FINAL FALLBACK: assign an equal‑weight portfolio so the app
+                # can keep running even when yfinance is unavailable (e.g.
+                # due to rate‑limits on Streamlit Cloud).
+                # ------------------------------------------------------------
+                print("Still no data available from yfinance. Falling back to equal‑weight portfolio.\n")
+                hrp_weights = pd.Series(1.0 / len(tickers_list), index=tickers_list)
+
+                print("HRP portfolio weights (equal weight fallback):\n")
+                for tck, wgt in hrp_weights.items():
+                    full_name = _get_ticker_full_name(tck)
+                    label = f"{tck} ({full_name})" if full_name and full_name != tck else tck
+                    print(f"{label}: {wgt:.4f}")
+
+                print("\nFinished HRP run successfully (fallback mode).\n")
+                # Restore stdout and return early
+                sys.stdout = old_stdout
+                return log_buffer.getvalue()
         data = data.ffill().dropna()
         data = data["Close"]
         print("Downloaded data from yfinance successfully.\n")
@@ -976,7 +993,7 @@ def run_td3_agent_thread(out_queue, hyper_json):
         env.reset()
         env.render()
 
-        state_dim  = env.observation_space.shape[0]
+        state_dim  = 8
         action_dim = env.action_space.shape[0]
 
         # ---------- tiny TD3 networks ----------
