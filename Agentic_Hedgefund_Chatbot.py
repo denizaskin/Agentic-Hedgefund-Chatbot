@@ -1126,7 +1126,7 @@ def run_td3_agent_thread(out_queue, hyper_json, hrp_weights_json):
         print(f"TD3 Agent created. Hyperparameters:\n actor_lr={actor_lr}, critic_lr={critic_lr}, gamma={gamma}, tau={tau}\n")
 
         # ---------- training loop ----------
-        num_episodes = 50
+        num_episodes = 10
         max_steps    = 80
         batch_size   = 32
 
