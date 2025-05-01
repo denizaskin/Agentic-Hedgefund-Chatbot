@@ -26,6 +26,25 @@ import numpy as np
 import gym
 from gym import spaces
 import yfinance as yf
+
+# ---------------------- Ticker name helper -----------------------
+from functools import lru_cache
+
+@lru_cache(maxsize=256)
+def _get_ticker_full_name(tck: str) -> str:
+    """
+    Return a human‑readable name for a Yahoo Finance ticker.  Falls back
+    to the ticker itself if no name can be fetched quickly.
+    """
+    try:
+        info = yf.Ticker(tck).fast_info  # cheap call
+        # `fast_info` has no company name, so try `.info` with timeout
+        if not info:
+            raise ValueError
+        long_name = yf.Ticker(tck).info.get("longName") or yf.Ticker(tck).info.get("shortName")
+        return long_name or tck
+    except Exception:
+        return tck
 import torch.nn as nn
 import torch.optim as optim
 import random
@@ -151,6 +170,21 @@ def sanitize_control_chars(text: str) -> str:
     import re
     return re.sub(r'[\x00-\x1f\x7f]+', ' ', text)
 
+# --------------------------------------------------------------------------
+# Helper: build a short "known facts" string from answered USER subtasks
+# --------------------------------------------------------------------------
+def _build_known_facts(subtask_answers):
+    """
+    Collect every answered USER subtask into a compact \n‑separated list
+    of ‘question -> answer’ lines that we can feed back into the planner
+    on rerun.  Ignores LLM subtasks.
+    """
+    facts = []
+    for ans in subtask_answers:
+        if ans and ans.get("type") == "USER":
+            facts.append(f"{ans['task']} -> {ans['answer']}")
+    return "\n".join(facts)
+
 def _is_valid_ticker(tck: str) -> bool:
     """
     Return True if `tck` looks syntactically like a Yahoo Finance symbol
@@ -217,6 +251,8 @@ subtasks needed to address the user’s question thoroughly.
 Context Provided:
 1) PDF Content: {{pdf_text}}
 2) Existing user question/input: "{{user_question}}"
+3) Known facts from prior user answers (if any):
+{{known_facts}}
 
 Your Objective:
 1) Figure out each step or piece of information required to provide a complete, 
@@ -259,6 +295,7 @@ class AgentWorkflowState(TypedDict):
     planner_output: str
     execution_result: dict
     final_answer: str
+    known_facts: str
 
 class SubTask(BaseModel):
     task: str = Field(..., description="Subtask description")
@@ -278,8 +315,13 @@ def stream_llm_call(prompt: str) -> str:
 def compliance_planner_node(state: AgentWorkflowState) -> AgentWorkflowState:
     pdf_text = state["pdf_text"]
     user_question = state["user_question"]
-    final_planner_prompt = PLANNER_PROMPT_TEXT.replace("{{pdf_text}}", pdf_text)\
-                                             .replace("{{user_question}}", user_question)
+    known_facts = state.get("known_facts", "")
+    final_planner_prompt = (
+        PLANNER_PROMPT_TEXT
+        .replace("{{pdf_text}}", pdf_text)
+        .replace("{{user_question}}", user_question)
+        .replace("{{known_facts}}", known_facts)
+    )
     raw_output = stream_llm_call(final_planner_prompt)
     parser = PydanticOutputParser(pydantic_object=PlannerOutput)
     try:
@@ -369,7 +411,18 @@ Return valid JSON only.
     raw_text = stream_llm_call(prompt)
     try:
         structured = parser.parse(raw_text)
-        return structured.model_dump()
+
+        # ---- NEW: validate LLM-suggested tickers ---------------------------
+        hrp_dict = structured.model_dump()
+        raw = hrp_dict.get("tickers", [])
+        valid = [t for t in raw if _is_valid_ticker(t)]
+
+        # if nothing survives validation, fall back to the 7-ETF core set
+        if not valid:
+            valid = ["SPY", "EFA", "EEM", "AGG", "LQD", "GLD", "DBC"]
+
+        hrp_dict["tickers"] = valid
+        return hrp_dict
     except ValidationError as e:
         print(f"Validation error: {e}")
         return {}
@@ -379,18 +432,45 @@ Return valid JSON only.
 ###############################################################################
 def hyperparameter_decider(hrp_output: str) -> str:
     """
-    This function instructs the LLM to decide TD3 hyperparameters 
-    (actor_lr, critic_lr, gamma, tau, etc.) from the HRP output.
+    This function instructs a separate LLM instance (temperature=0.3) to decide TD3 hyperparameters 
+    (actor_lr, critic_lr, gamma, tau, trading_style, etc.) by using both 
+    the HRP output and the chatbot's final report.
     """
+    from langchain.schema import HumanMessage
+
+    # We'll fetch the final chatbot answer (report) from session state:
+    final_report = st.session_state.get("final_answer", "")
+
+    # Rewritten prompt to be more dynamic:
     prompt = f"""
-You are a hyperparameter decider for a TD3 trading agent.
-Given this HRP output:
+You are a specialized hyperparameter decider for a TD3 trading agent.
+We have an HRP result:
 {hrp_output}
 
-Return valid JSON with keys like "actor_lr", "critic_lr", "gamma", "tau", "trading_style" etc.
-No extra text or commentary, just valid JSON.
+We also have the final chatbot report:
+{final_report}
+
+Please propose an appropriate set of TD3 hyperparameters.
+Return valid JSON with keys such as "actor_lr", "critic_lr", "gamma", "tau", "trading_style", etc.
+No extra text or commentary. Just valid JSON.
 """
-    return stream_llm_call(prompt).strip()
+
+    # Create a new LLM instance with temperature=0.3, leaving all else unchanged
+    llm_temp_03 = ChatOpenAI(
+        model="gpt-4o",
+        temperature=0.3,
+        max_tokens=None,
+        timeout=None,
+        max_retries=2,
+        api_key=openai_apikey
+    )
+
+    try:
+        response_msg = llm_temp_03.invoke([HumanMessage(content=prompt)])
+        raw_text = response_msg.content if hasattr(response_msg, "content") else response_msg[0].content
+        return sanitize_control_chars(raw_text).strip()
+    except Exception as e:
+        return f"Error in hyperparameter_decider: {e}"
 
 ###############################################################################
 # GET PREPROCESSED DATA => df_merged
@@ -406,13 +486,10 @@ def safe_download(ticker: str, start: str, end: str):
         df = yf.download(ticker, period="1y", auto_adjust=True, progress=False)
         if df is None or df.empty:
             raise ValueError(f"yfinance returned no data for {ticker}.")
-    # If there's a MultiIndex with name='Ticker', drop that level
     if isinstance(df.columns, pd.MultiIndex) and "Ticker" in df.columns.names:
         df.columns = df.columns.droplevel("Ticker")
-    # If there's still a multi-level index, flatten it
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.droplevel(0)
-    # Rename 'Adj Close' to 'Close' if "Close" not present
     if "Close" not in df.columns and "Adj Close" in df.columns:
         df.rename(columns={"Adj Close": "Close"}, inplace=True)
     return df
@@ -427,63 +504,104 @@ def get_preprocessed_data():
 
     def compute_SMA(series, window=14):
         return series.rolling(window=window).mean()
+
     def compute_RSI(series, window=14):
         delta = series.diff()
         gain = delta.clip(lower=0).rolling(window=window).mean()
         loss = -delta.clip(upper=0).rolling(window=window).mean()
         rs = gain / (loss + 1e-6)
         return 100 - (100 / (1 + rs))
+
     def compute_bollinger_bands(series, window=20, num_std=2):
         sma = series.rolling(window=window).mean()
         std = series.rolling(window=window).std()
         upper = sma + num_std * std
         lower = sma - num_std * std
         return sma, upper, lower
+
     def compute_momentum(series, window=5):
         return series.pct_change(window) * 100
+
     def compute_volatility(series, window=20):
         returns = series.pct_change()
         return returns.rolling(window=window).std()
+
     def compute_vix(series, window=20):
         vol = compute_volatility(series, window=window)
         return vol * np.sqrt(252) * 100
+
     def add_technical_indicators(df):
-        df['SMA'] = compute_SMA(df['Close'])
-        df['RSI'] = compute_RSI(df['Close'])
-        sma, bb_upper, bb_lower = compute_bollinger_bands(df['Close'])
-        df['BB_upper'] = bb_upper
-        df['BB_lower'] = bb_lower
-        df['Momentum'] = compute_momentum(df['Close'])
-        df['Volatility'] = compute_volatility(df['Close'])
+        """
+        Add common technical indicators to a price DataFrame and return a
+        cleaned version.  This implementation is robust to the edge‑case
+        where df["Close"] accidentally resolves to a *DataFrame* (because
+        duplicate 'Close' columns slipped through), which previously caused
+        the “Cannot set a DataFrame with multiple columns to the single
+        column …” ValueError.
+
+        Parameters
+        ----------
+        df : pandas.DataFrame
+            Must contain at least one column named 'Close'.
+
+        Returns
+        -------
+        pandas.DataFrame
+            Same index as `df` with the indicators appended and NaNs
+            dropped.
+        """
+        # Guard‑rail: if "Close" is a DataFrame (duplicate columns), just
+        # take the first column so we always hand a Series to the indicator
+        # helpers.
+        close_obj = df["Close"]
+        if isinstance(close_obj, pd.DataFrame):
+            close_series = close_obj.iloc[:, 0]
+        else:
+            close_series = close_obj.squeeze()
+
+        # Work on a private copy so we don't mutate the caller unexpectedly
+        df = df.copy()
+
+        df["SMA"] = compute_SMA(close_series)
+        df["RSI"] = compute_RSI(close_series)
+        sma, bb_upper, bb_lower = compute_bollinger_bands(close_series)
+        df["BB_upper"] = bb_upper
+        df["BB_lower"] = bb_lower
+        df["Momentum"] = compute_momentum(close_series)
+        df["Volatility"] = compute_volatility(close_series)
+
+        # Drop any rows with NaNs introduced by rolling calculations
         return df.dropna()
 
-    # Single-col DFs
-    spy_df = add_technical_indicators(spy_raw[['Close']].copy())
-    qqq_df = add_technical_indicators(qqq_raw[['Close']].copy())
+    spy_single = spy_raw[["Close"]].copy()
+    qqq_single = qqq_raw[["Close"]].copy()
+
+    spy_df = add_technical_indicators(spy_single)
+    qqq_df = add_technical_indicators(qqq_single)
 
     spy_df = spy_df.rename(columns={
-        'Close': 'Close_spy_SPY',
-        'SMA': 'SMA_spy_',
-        'RSI': 'RSI_spy_',
-        'BB_upper': 'BB_upper_spy_',
-        'BB_lower': 'BB_lower_spy_',
-        'Momentum': 'Momentum_spy_',
-        'Volatility': 'Volatility_spy_'
+        "Close": "Close_spy_SPY",
+        "SMA": "SMA_spy_",
+        "RSI": "RSI_spy_",
+        "BB_upper": "BB_upper_spy_",
+        "BB_lower": "BB_lower_spy_",
+        "Momentum": "Momentum_spy_",
+        "Volatility": "Volatility_spy_"
     })
     qqq_df = qqq_df.rename(columns={
-        'Close': 'Close_qqq_QQQ',
-        'SMA': 'SMA_qqq_',
-        'RSI': 'RSI_qqq_',
-        'BB_upper': 'BB_upper_qqq_',
-        'BB_lower': 'BB_lower_qqq_',
-        'Momentum': 'Momentum_qqq_',
-        'Volatility': 'Volatility_qqq_'
+        "Close": "Close_qqq_QQQ",
+        "SMA": "SMA_qqq_",
+        "RSI": "RSI_qqq_",
+        "BB_upper": "BB_upper_qqq_",
+        "BB_lower": "BB_lower_qqq_",
+        "Momentum": "Momentum_qqq_",
+        "Volatility": "Volatility_qqq_"
     })
 
-    spy_raw['VIX_proxy'] = compute_vix(spy_raw['Close'])
+    spy_raw["VIX_proxy"] = compute_vix(spy_raw["Close"].squeeze())
     np.random.seed(42)
-    spy_raw['Sentiment'] = np.random.uniform(-1, 1, size=len(spy_raw))
-    spy_vix_sent = spy_raw[['VIX_proxy', 'Sentiment']].dropna()
+    spy_raw["Sentiment"] = np.random.uniform(-1, 1, size=len(spy_raw))
+    spy_vix_sent = spy_raw[["VIX_proxy", "Sentiment"]].dropna()
 
     spy_df = spy_df.loc[spy_vix_sent.index]
     qqq_df = qqq_df.loc[spy_vix_sent.index]
@@ -550,10 +668,10 @@ class AdvancedMultiAssetTradingEnv(gym.Env):
         if self.current_step > 0:
             prev_row = self.df.iloc[self.current_step - 1]
             row = self.df.iloc[self.current_step]
-            prev_spy = float(prev_row['Close_spy_SPY'])
-            cur_spy = float(row['Close_spy_SPY'])
-            prev_qqq = float(prev_row['Close_qqq_QQQ'])
-            cur_qqq = float(row['Close_qqq_QQQ'])
+            prev_spy = float(prev_row["Close_spy_SPY"])
+            cur_spy = float(row["Close_spy_SPY"])
+            prev_qqq = float(prev_row["Close_qqq_QQQ"])
+            cur_qqq = float(row["Close_qqq_QQQ"])
             ret_spy = (cur_spy / prev_spy) - 1.0
             ret_qqq = (cur_qqq / prev_qqq) - 1.0
         else:
@@ -619,7 +737,7 @@ def run_hrp_inline(chatbot_answer: str, hrp_params: dict) -> str:
             if data is None or data.empty:
                 raise ValueError("No data returned from yfinance after fallback either!")
         data = data.ffill().dropna()
-        data = data['Close']
+        data = data["Close"]
         print("Downloaded data from yfinance successfully.\n")
 
         daily_returns = data.pct_change().fillna(0)
@@ -653,7 +771,7 @@ def run_hrp_inline(chatbot_answer: str, hrp_params: dict) -> str:
 
         def get_cluster_variance(cov, cluster_items):
             sub_cov = cov.loc[cluster_items, cluster_items]
-            inv_diag = 1. / np.diag(sub_cov)
+            inv_diag = 1.0 / np.diag(sub_cov)
             weights = inv_diag / np.sum(inv_diag)
             return np.dot(weights, np.dot(sub_cov, weights))
 
@@ -696,7 +814,9 @@ def run_hrp_inline(chatbot_answer: str, hrp_params: dict) -> str:
 
         print("HRP portfolio weights:\n")
         for tck, wgt in hrp_weights.items():
-            print(f"{tck}: {wgt:.4f}")
+            full_name = _get_ticker_full_name(tck)
+            label = f"{tck} ({full_name})" if full_name and full_name != tck else tck
+            print(f"{label}: {wgt:.4f}")
 
         print("\nFinished HRP run successfully.\n")
 
@@ -755,13 +875,19 @@ Return only the updated query. No extra text.
 ###############################################################################
 def run_td3_agent_thread(out_queue, hyper_json):
     """
-    The entire TD3 agent code is the same except for the changes below:
-      - Actor/Critic layers: from [32, 32] down to [16, 16].
-      - Replay buffer size: from 1_000_000 down to 10_000.
-      - Fewer episodes: 10
-      - Fewer steps per episode: 30
-      - Smaller batch size: 8
-      - **Changed default hyperparameters** to encourage increasing rewards.
+    TD3 training thread – re‑tuned so that the agent can actually learn on the
+    tiny demo dataset while still staying light enough for Streamlit‑Free.
+
+    Key changes vs. the previous version
+    ------------------------------------
+    * Many more interactions:   num_episodes = 50, max_steps = 80
+    * Larger replay buffer:     50 000 transitions
+    * More frequent updates:    we update **every step** (was every 5)
+    * Bigger batches / faster   batch_size = 32 (was 8) and lr = 1e‑3
+    * Slightly gentler noise:   policy_noise = 0.1, noise_clip = 0.05
+    * policy_freq = 2           (actor updated every other critic step)
+    None of these changes inject any “fake” reward – they simply give the TD3
+    algorithm enough signal and gradient steps to discover better policies.
     """
     import json
 
@@ -777,204 +903,165 @@ def run_td3_agent_thread(out_queue, hyper_json):
     original_stdout = sys.stdout
     sys.stdout = QueueStream(out_queue)
     try:
+        # ---------- hyper‑parameter JSON parsing ----------
         try:
             params = json.loads(hyper_json)
-            # If user didn't specify, we default to these more "growth-friendly" hyperparams
-            actor_lr = float(params.get("actor_lr", 1e-3))
+            actor_lr  = float(params.get("actor_lr", 1e-3))
             critic_lr = float(params.get("critic_lr", 1e-3))
-            gamma = float(params.get("gamma", 0.998))
-            tau = float(params.get("tau", 0.05))
-        except:
-            actor_lr = 1e-3
-            critic_lr = 1e-3
-            gamma = 0.998
-            tau = 0.05
+            gamma     = float(params.get("gamma", 0.99))
+            tau       = float(params.get("tau", 0.01))
+        except Exception:
+            actor_lr, critic_lr, gamma, tau = 1e-3, 1e-3, 0.99, 0.01
 
+        # ---------- minimal env wrapper (unchanged dynamics, new reward) ----------
         class EnhancedTradingEnv(AdvancedMultiAssetTradingEnv):
             def step(self, action):
-                current_idx = self.current_step
+                cur_idx = self.current_step
                 self.current_step += 1
                 done = (self.current_step >= len(self.df) - 1)
 
-                if current_idx > 0:
-                    prev_row = self.df.iloc[current_idx - 1]
-                    row = self.df.iloc[self.current_step]
-                    prev_spy = float(prev_row['Close_spy_SPY'])
-                    cur_spy = float(row['Close_spy_SPY'])
-                    prev_qqq = float(prev_row['Close_qqq_QQQ'])
-                    cur_qqq = float(row['Close_qqq_QQQ'])
-                    ret_spy = (cur_spy / prev_spy) - 1.0
-                    ret_qqq = (cur_qqq / prev_qqq) - 1.0
+                if cur_idx > 0:
+                    prev_row = self.df.iloc[cur_idx - 1]
+                    row      = self.df.iloc[self.current_step]
+                    ret_spy  = (row["Close_spy_SPY"] / prev_row["Close_spy_SPY"]) - 1.0
+                    ret_qqq  = (row["Close_qqq_QQQ"] / prev_row["Close_qqq_QQQ"]) - 1.0
                 else:
-                    ret_spy = 0.0
-                    ret_qqq = 0.0
+                    ret_spy = ret_qqq = 0.0
 
-                w_spy = max(0.0, min(float(action[0]), 1.0))
-                w_qqq = max(0.0, min(float(action[1]), 1.0))
+                w_spy = float(np.clip(action[0], 0, 1))
+                w_qqq = float(np.clip(action[1], 0, 1))
 
-                day_return = (w_spy * ret_spy) + (w_qqq * ret_qqq)
-                self.portfolio_value *= (1.0 + day_return)
-                self.alloc_spy = w_spy
-                self.alloc_qqq = w_qqq
+                day_ret = (w_spy * ret_spy) + (w_qqq * ret_qqq)
+                self.portfolio_value *= (1.0 + day_ret)
 
-                # SHIFT THE REWARD => day_return * 1000 + 50
-                reward = (day_return * 1000.0) + 50.0
+                # remove the previous constant +50 – let reward be pure PnL signal
+                reward = day_ret * 1_000.0     # scale to nice ≈[‑20, +20] range
 
-                next_state = self._get_state()
-                return next_state, float(reward), done, {}
+                self.alloc_spy, self.alloc_qqq = w_spy, w_qqq
+                return self._get_state(), float(reward), done, {}
 
         print("Environment initialized. Ready for training.\n")
         env = EnhancedTradingEnv(df_merged)
         env.reset()
         env.render()
 
-        state_dim = env.observation_space.shape[0]
+        state_dim  = env.observation_space.shape[0]
         action_dim = env.action_space.shape[0]
 
-        class TD3Actor(nn.Module):
-            def __init__(self, state_dim, action_dim):
+        # ---------- tiny TD3 networks ----------
+        class Actor(nn.Module):
+            def __init__(self, s_dim, a_dim):
                 super().__init__()
                 self.net = nn.Sequential(
-                    nn.Linear(state_dim, 16),
-                    nn.ReLU(),
-                    nn.Linear(16, 16),
-                    nn.ReLU(),
-                    nn.Linear(16, action_dim),
-                    nn.Sigmoid()
+                    nn.Linear(s_dim, 32), nn.ReLU(),
+                    nn.Linear(32, 32),   nn.ReLU(),
+                    nn.Linear(32, a_dim), nn.Sigmoid()
                 )
-            def forward(self, x):
-                return self.net(x)
+            def forward(self, x): return self.net(x)
 
-        class TD3Critic(nn.Module):
-            def __init__(self, state_dim, action_dim):
+        class Critic(nn.Module):
+            def __init__(self, s_dim, a_dim):
                 super().__init__()
                 self.net = nn.Sequential(
-                    nn.Linear(state_dim + action_dim, 16),
-                    nn.ReLU(),
-                    nn.Linear(16, 16),
-                    nn.ReLU(),
-                    nn.Linear(16, 1)
+                    nn.Linear(s_dim + a_dim, 32), nn.ReLU(),
+                    nn.Linear(32, 32),            nn.ReLU(),
+                    nn.Linear(32, 1)
                 )
-            def forward(self, state, action):
-                return self.net(torch.cat([state, action], dim=1))
+            def forward(self, s, a): return self.net(torch.cat([s, a], dim=1))
 
+        # ---------- replay buffer ----------
         class ReplayBuffer:
-            def __init__(self, capacity):
+            def __init__(self, capacity=50_000):
                 self.buffer = deque(maxlen=capacity)
-            def push(self, state, action, reward, next_state, done):
-                self.buffer.append((state, action, reward, next_state, done))
+            def push(self, *transition): self.buffer.append(tuple(transition))
             def sample(self, batch_size):
                 batch = random.sample(self.buffer, batch_size)
-                state, action, reward, next_state, done = map(np.stack, zip(*batch))
-                return state, action, reward, next_state, done
-            def __len__(self):
-                return len(self.buffer)
+                return map(np.stack, zip(*batch))
+            def __len__(self): return len(self.buffer)
 
+        # ---------- TD3 Agent ----------
         class TD3Agent:
-            def __init__(
-                self,
-                state_dim,
-                action_dim,
-                actor_lr=actor_lr,
-                critic_lr=critic_lr,
-                gamma=gamma,
-                tau=tau,
-                policy_noise=0.1,
-                noise_clip=0.2,
-                policy_freq=1,
-                device='cpu'
-            ):
-                self.actor = TD3Actor(state_dim, action_dim).to(device)
-                self.actor_target = TD3Actor(state_dim, action_dim).to(device)
+            def __init__(self, s_dim, a_dim):
+                self.actor        = Actor(s_dim, a_dim)
+                self.actor_target = Actor(s_dim, a_dim)
                 self.actor_target.load_state_dict(self.actor.state_dict())
 
-                self.critic1 = TD3Critic(state_dim, action_dim).to(device)
-                self.critic2 = TD3Critic(state_dim, action_dim).to(device)
-                self.critic1_target = TD3Critic(state_dim, action_dim).to(device)
-                self.critic2_target = TD3Critic(state_dim, action_dim).to(device)
+                self.critic1        = Critic(s_dim, a_dim)
+                self.critic1_target = Critic(s_dim, a_dim)
                 self.critic1_target.load_state_dict(self.critic1.state_dict())
+
+                self.critic2        = Critic(s_dim, a_dim)
+                self.critic2_target = Critic(s_dim, a_dim)
                 self.critic2_target.load_state_dict(self.critic2.state_dict())
 
-                self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=actor_lr)
-                self.critic1_optimizer = optim.Adam(self.critic1.parameters(), lr=critic_lr)
-                self.critic2_optimizer = optim.Adam(self.critic2.parameters(), lr=critic_lr)
+                self.opt_actor   = optim.Adam(self.actor.parameters(),  lr=actor_lr)
+                self.opt_critic1 = optim.Adam(self.critic1.parameters(), lr=critic_lr)
+                self.opt_critic2 = optim.Adam(self.critic2.parameters(), lr=critic_lr)
 
-                self.replay_buffer = ReplayBuffer(10_000)
-                self.gamma = gamma
-                self.tau = tau
-                self.policy_noise = policy_noise
-                self.noise_clip = noise_clip
-                self.policy_freq = policy_freq
-                self.device = device
+                self.rb     = ReplayBuffer()
+                self.gamma  = gamma
+                self.tau    = tau
                 self.total_it = 0
 
+                # exploration settings
+                self.policy_noise = 0.1
+                self.noise_clip   = 0.05
+                self.policy_freq  = 2
+
+            @torch.no_grad()
             def select_action(self, state):
-                s = torch.FloatTensor(state).unsqueeze(0).to(self.device)
-                base_action = self.actor(s).cpu().data.numpy().flatten()
-                # Lower noise than default to help stable learning
-                noise = np.random.normal(0, 0.01, size=base_action.shape)
-                action = np.clip(base_action + noise, 0, 1)
-                return action
+                a = self.actor(torch.FloatTensor(state).unsqueeze(0)).cpu().numpy().flatten()
+                a += np.random.normal(0, 0.02, size=a.shape)
+                return np.clip(a, 0, 1)
 
             def update(self, batch_size):
-                if len(self.replay_buffer) < batch_size:
-                    return
-
+                if len(self.rb) < batch_size: return
                 self.total_it += 1
-                state, action, reward, next_state, done = self.replay_buffer.sample(batch_size)
-                state = torch.FloatTensor(state).to(self.device)
-                action = torch.FloatTensor(action).to(self.device)
-                reward = torch.FloatTensor(reward).unsqueeze(1).to(self.device)
-                next_state = torch.FloatTensor(next_state).to(self.device)
-                done = torch.FloatTensor(done).unsqueeze(1).to(self.device)
+                s, a, r, ns, d = self.rb.sample(batch_size)
+                s  = torch.FloatTensor(s)
+                a  = torch.FloatTensor(a)
+                r  = torch.FloatTensor(r).unsqueeze(1)
+                ns = torch.FloatTensor(ns)
+                d  = torch.FloatTensor(d).unsqueeze(1)
 
                 with torch.no_grad():
-                    noise = (torch.randn_like(action) * self.policy_noise).clamp(-self.noise_clip, self.noise_clip)
-                    next_action = self.actor_target(next_state)
-                    next_action = (next_action + noise).clamp(0, 1)
+                    noise = (torch.randn_like(a) * self.policy_noise).clamp(-self.noise_clip, self.noise_clip)
+                    na = (self.actor_target(ns) + noise).clamp(0, 1)
+                    tq1 = self.critic1_target(ns, na)
+                    tq2 = self.critic2_target(ns, na)
+                    tq  = r + (1 - d) * self.gamma * torch.min(tq1, tq2)
 
-                    target_q1 = self.critic1_target(next_state, next_action)
-                    target_q2 = self.critic2_target(next_state, next_action)
-                    target_q = torch.min(target_q1, target_q2)
-                    target_q = reward + (1 - done) * self.gamma * target_q
+                # critic 1
+                cq1 = self.critic1(s, a)
+                loss_q1 = nn.MSELoss()(cq1, tq)
+                self.opt_critic1.zero_grad(); loss_q1.backward(); self.opt_critic1.step()
 
-                current_q1 = self.critic1(state, action)
-                loss_q1 = nn.MSELoss()(current_q1, target_q)
-                self.critic1_optimizer.zero_grad()
-                loss_q1.backward()
-                self.critic1_optimizer.step()
+                # critic 2
+                cq2 = self.critic2(s, a)
+                loss_q2 = nn.MSELoss()(cq2, tq)
+                self.opt_critic2.zero_grad(); loss_q2.backward(); self.opt_critic2.step()
 
-                current_q2 = self.critic2(state, action)
-                loss_q2 = nn.MSELoss()(current_q2, target_q)
-                self.critic2_optimizer.zero_grad()
-                loss_q2.backward()
-                self.critic2_optimizer.step()
-
-                # Update actor more often (policy_freq=1)
+                # delayed actor update
                 if self.total_it % self.policy_freq == 0:
-                    actor_loss = -self.critic1(state, self.actor(state)).mean()
-                    self.actor_optimizer.zero_grad()
-                    actor_loss.backward()
-                    self.actor_optimizer.step()
+                    act_loss = -self.critic1(s, self.actor(s)).mean()
+                    self.opt_actor.zero_grad(); act_loss.backward(); self.opt_actor.step()
 
-                    for param, target_param in zip(self.actor.parameters(), self.actor_target.parameters()):
-                        target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
-                    for param, target_param in zip(self.critic1.parameters(), self.critic1_target.parameters()):
-                        target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
-                    for param, target_param in zip(self.critic2.parameters(), self.critic2_target.parameters()):
-                        target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
+                    for p, tp in zip(self.actor.parameters(), self.actor_target.parameters()):
+                        tp.data.copy_(self.tau * p.data + (1 - self.tau) * tp.data)
+                    for p, tp in zip(self.critic1.parameters(), self.critic1_target.parameters()):
+                        tp.data.copy_(self.tau * p.data + (1 - self.tau) * tp.data)
+                    for p, tp in zip(self.critic2.parameters(), self.critic2_target.parameters()):
+                        tp.data.copy_(self.tau * p.data + (1 - self.tau) * tp.data)
 
         agent = TD3Agent(state_dim, action_dim)
         print(f"TD3 Agent created. Hyperparameters:\n actor_lr={actor_lr}, critic_lr={critic_lr}, gamma={gamma}, tau={tau}\n")
 
-        rewards = []
-        portfolio_values = []
+        # ---------- training loop ----------
+        num_episodes = 50
+        max_steps    = 80
+        batch_size   = 32
 
-        num_episodes = 10
-        batch_size = 8
-        max_steps = 30
-
-        print("Training TD3 Agent...\n")
+        rewards, portfolios = [], []
         base_date = datetime(2025, 1, 1)
 
         for ep in range(num_episodes):
@@ -983,35 +1070,19 @@ def run_td3_agent_thread(out_queue, hyper_json):
             for step in range(max_steps):
                 action = agent.select_action(state)
                 next_state, reward, done, _ = env.step(action)
-                agent.replay_buffer.push(state, action, reward, next_state, float(done))
+                agent.rb.push(state, action, reward, next_state, float(done))
                 state = next_state
                 ep_reward += reward
 
-                if step % 5 == 0:
-                    agent.update(batch_size)
-
-                if done:
-                    break
+                agent.update(batch_size)
+                if done: break
 
             rewards.append(ep_reward)
+            portfolios.append(float(env.portfolio_value))
             smoothed = float(np.mean(rewards[-5:]))
-
-            ep_date = base_date + relativedelta(months=ep)
-            ep_date_str = ep_date.strftime("%m/%d/%Y")
-            portfolio_values.append(float(env.portfolio_value))
-
-            print(
-                f"Episode (Month) {ep+1}/{num_episodes} ({ep_date_str}), "
-                f"Reward: {ep_reward:.4f}, "
-                f"Smoothed: {smoothed:.4f}, "
-                f"Final Portfolio: ${env.portfolio_value:.2f}\n"
-            )
-
-            metrics_update = json.dumps({
-                "smoothed_rewards": [float(x) for x in rewards],
-                "portfolio_values": [float(x) for x in portfolio_values]
-            })
-            print(f"METRICS_UPDATE: {metrics_update}\n")
+            ep_date  = (base_date + relativedelta(months=ep)).strftime("%m/%d/%Y")
+            print(f"Episode (Month) {ep+1}/{num_episodes} ({ep_date}), Reward: {ep_reward:.2f}, Smoothed: {smoothed:.2f}, Final Portfolio: ${env.portfolio_value:,.2f}\n")
+            print(f"METRICS_UPDATE: {json.dumps({'smoothed_rewards':[float(x) for x in rewards], 'portfolio_values':[float(x) for x in portfolios]})}\n")
 
         print("\nTD3 Training complete.\n")
 
@@ -1126,7 +1197,8 @@ def main():
                                 "pdf_text": st.session_state.pdf_text,
                                 "planner_output": "",
                                 "execution_result": {},
-                                "final_answer": ""
+                                "final_answer": "",
+                                "known_facts": "",
                             }
                             planner_state = compliance_planner_node(init_state)
                             st.session_state.planner_output = planner_state["planner_output"]
@@ -1184,7 +1256,8 @@ Else answer.
                         missing_q_raw = llm_response.split(":", 1)[1].strip() if ":" in llm_response else ""
                         if not missing_q_raw:
                             missing_q_raw = "Could you please provide the missing information?"
-                        missing_q = missing_q_raw
+                        # Ensure every USER subtask is phrased as a direct question
+                        missing_q = rewrite_subtask_as_question(missing_q_raw)
 
                         insert_pos = st.session_state.subtask_index + 1
                         st.session_state.subtasks.insert(
@@ -1237,7 +1310,8 @@ Else answer.
                         "pdf_text": st.session_state.pdf_text,
                         "planner_output": st.session_state.planner_output,
                         "execution_result": {"subtask_answers": st.session_state.subtask_answers},
-                        "final_answer": ""
+                        "final_answer": "",
+                        "known_facts": "",
                     }
                     workflow = build_workflow().compile()
                     final_state = workflow.invoke(final_state)
@@ -1268,8 +1342,16 @@ Else answer.
             st.success("HRP parameters decided. Now you can run HRP.")
 
         if st.session_state.hrp_json:
-            st.write("### Decided HRP Parameters (JSON)")
-            st.text_area("HRP Params", st.session_state.hrp_json, height=250)
+            # build a user‑friendly version that appends full names next to tickers
+            hrp_display = json.loads(st.session_state.hrp_json or "{}")
+            if isinstance(hrp_display.get("tickers"), list):
+                pretty = []
+                for t in hrp_display["tickers"]:
+                    name = _get_ticker_full_name(t)
+                    pretty.append(f"{t} ({name})" if name and name != t else t)
+                hrp_display["tickers"] = pretty
+            st.write("### Decided HRP Parameters (with ticker names)")
+            st.text_area("HRP Params", json.dumps(hrp_display, indent=4), height=250)
 
         run_hrp_btn = st.button(
             "Run Hierarchical Risk Parity",
@@ -1429,11 +1511,16 @@ Else answer.
                             explanation = rep_dict.get("Explanation", "")
                             new_query = requery_llm(st.session_state.user_question_input, explanation)
 
-                            st.session_state.conversation = []
+                            # Build known facts from prior USER subtasks before resetting answers
+                            known_facts = _build_known_facts(st.session_state.subtask_answers)
+
+                            # Remove the line that cleared conversation; retain prior dialogue
+                            # st.session_state.conversation = []
                             st.session_state.planner_output = ""
                             st.session_state.subtasks = []
                             st.session_state.subtask_index = 0
-                            st.session_state.subtask_answers = []
+                            # Remove the line that cleared subtask_answers before computing known facts
+                            # st.session_state.subtask_answers = []
                             st.session_state.final_answer = ""
                             st.session_state.hrp_json = ""
                             st.session_state.hrp_dict = {}
@@ -1456,7 +1543,8 @@ Else answer.
                                 "pdf_text": st.session_state.pdf_text,
                                 "planner_output": "",
                                 "execution_result": {},
-                                "final_answer": ""
+                                "final_answer": "",
+                                "known_facts": known_facts,
                             }
                             planner_state = compliance_planner_node(revised_state)
                             st.session_state.planner_output = planner_state["planner_output"]
